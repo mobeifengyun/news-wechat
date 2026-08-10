@@ -8,12 +8,16 @@
   python collect.py [YYYY-MM-DD]
 
 环境变量:
-  LLM_API_KEY    必填，大模型 API Key（如 Gemini / DeepSeek）
+  LLM_API_KEY    必填，大模型 API Key（Gemini / Kimi / DeepSeek 等皆可）
   LLM_BASE_URL   可选，兼容 /chat/completions 的基址
-                 默认 https://generativelanguage.googleapis.com/v1beta/openai/
-  LLM_MODEL      可选，模型名（默认 gemini-2.5-flash）
+                 Gemini 默认 https://generativelanguage.googleapis.com/v1beta/openai/
+                 Kimi 国内可达：https://api.moonshot.cn/v1（自带联网搜索，无需 Google）
+  LLM_MODEL      可选，模型名（Gemini 默认 gemini-2.5-flash；Kimi 默认 kimi-k2.6）
   TAVILY_API_KEY 可选，配置了就改用 Tavily 限定白名单域名检索（最稳，免费 1000次/月）
-  SEARCH_MODE    auto|tavily|none（默认 auto：有 Tavily 用 Tavily，否则走 Gemini 联网搜索）
+  SEARCH_MODE    auto|tavily|kimi|none
+                 auto：有 Tavily 用 Tavily，否则按 BASE_URL 自动判断（Gemini 走 googleSearch，Kimi 走 $web_search）
+                 kimi：强制用 Kimi/Moonshot 内置联网搜索（国内用户首选，免 Google）
+                 none：不联网（不推荐，新闻会失真）
 
 约束（与本地流程完全一致）:
   - 来源必须是 config.json 的 source_whitelist 白名单
@@ -149,6 +153,57 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
+
+
+# ---------------- Kimi / Moonshot 联网搜索 ----------------
+def kimi_chat(system, user, base_url, api_key, model):
+    """Kimi/Moonshot 内置 $web_search 工具联网搜索。
+
+    与 Gemini googleSearch 不同，Kimi 的搜索需要多轮 tool_call 回传：
+    模型先返回 tool_calls（含查询参数），客户端原样回传为 tool 消息，
+    平台在服务端执行搜索后给出最终答复。使用 $web_search 必须禁用 thinking。
+    """
+    import requests
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    tools = [{"type": "builtin_function", "function": {"name": "$web_search"}}]
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    for _ in range(6):
+        body = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.7,
+            "response_format": {"type": "json_object"},
+            "tools": tools,
+            "thinking": {"type": "disabled"},  # $web_search 必须禁用 thinking
+        }
+        r = requests.post(
+            url,
+            headers=headers,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            timeout=150,
+        )
+        r.raise_for_status()
+        msg = r.json()["choices"][0]["message"]
+        if not msg.get("tool_calls"):
+            return msg.get("content", "")
+        # 回传 assistant(tool_calls) + 每个 tool 的结果（Kimi 要求原样回传 arguments）
+        messages.append({
+            "role": "assistant",
+            "content": msg.get("content"),
+            "tool_calls": msg.get("tool_calls"),
+        })
+        for tc in msg.get("tool_calls") or []:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": tc["function"]["arguments"],
+            })
+    return None  # 超过轮次上限仍未出最终答案
+
 
 
 # ---------------- 校验 ----------------
@@ -329,8 +384,15 @@ def main():
 
     search_ctx = []
     use_tavily = (search_mode == "tavily") or (tavily_key and search_mode != "none")
+    use_kimi = (search_mode == "kimi") or (
+        "moonshot" in base_url and not use_tavily and search_mode != "none"
+    )
 
-    if use_tavily:
+    if use_kimi:
+        if model == DEFAULT_MODEL:  # 用户未显式指定模型时给 Kimi 默认
+            model = "kimi-k2.6"
+        print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model}")
+    elif use_tavily:
         print("检索模式：Tavily（限定白名单域名）")
         queries = [
             "今日国际新闻 新华社 央视", "今日财经动态 证券时报 第一财经",
@@ -346,7 +408,7 @@ def main():
         print("检索模式：Gemini 联网搜索（googleSearch grounding）")
 
     tools = None
-    if not use_tavily and "googleapis.com" in base_url and search_mode != "none":
+    if not use_tavily and not use_kimi and "googleapis.com" in base_url and search_mode != "none":
         tools = [{"googleSearch": {}}]
 
     errors = []
@@ -355,7 +417,10 @@ def main():
         sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors)
         print(f"第 {attempt+1} 次生成…")
         try:
-            raw = llm_chat(sys_p, usr_p, base_url, api_key, model, tools)
+            if use_kimi:
+                raw = kimi_chat(sys_p, usr_p, base_url, api_key, model)
+            else:
+                raw = llm_chat(sys_p, usr_p, base_url, api_key, model, tools)
             # 容错：去掉可能包裹的 ```json ``` 标记
             m = re.search(r"\{.*\}", raw, re.S)
             if m:

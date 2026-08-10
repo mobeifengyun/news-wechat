@@ -37,16 +37,24 @@ git push -u origin main
 
 | Secret 名 | 必填 | 说明 |
 |---|---|---|
-| `LLM_API_KEY` | ✅ | 大模型 Key。默认 Gemini：`https://aistudio.google.com/apikey` 免费申请 |
-| `LLM_BASE_URL` | 可选 | 默认 `https://generativelanguage.googleapis.com/v1beta/openai/`（Gemini OpenAI 兼容） |
-| `LLM_MODEL` | 可选 | 默认 `gemini-2.5-flash` |
+| `LLM_API_KEY` | ✅ | 大模型 Key。**国内首选 Kimi（月之暗面）**：`https://platform.moonshot.cn` 注册即送，站内申请 API Key（国内能打开，自带联网搜索，免 Google） |
+| `LLM_BASE_URL` | 可选 | 用 Kimi 时填 `https://api.moonshot.cn/v1`；用 Gemini 默认 `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| `LLM_MODEL` | 可选 | 用 Kimi 时填 `kimi-k2.6`；Gemini 默认 `gemini-2.5-flash` |
+| `SEARCH_MODE` | 可选 | 国内用 Kimi 填 `kimi`；Gemini 默认 `auto`；也可 `tavily`/`none` |
 | `TAVILY_API_KEY` | 可选 | 填了就改用 Tavily 限定白名单域名检索（最稳，免费 1000 次/月）|
-| `SEARCH_MODE` | 可选 | `auto`（默认）/ `tavily` / `none` |
-| `SCKEY` | 可选 | ServerChan Key（config.json 里已写，可不重复填）|
-| `WX_APPID` / `WX_APPSECRET` | 可选 | 填了才群发公众号；并把本机公网 IP 加进公众号后台 IP 白名单 |
+| `SCKEY` | **必填（云端）** | ServerChan Key。云端读不到本机 config.json，必须在此粘贴（即 config.json 里 `wechat.sckey` 那串 `SCT...`） |
+| `WX_APPID` / `WX_APPSECRET` | 可选 | 填了才群发公众号；并把 Actions 出口 IP 加进公众号后台 IP 白名单 |
 
-> 想用 DeepSeek 替代 Gemini：把 `LLM_BASE_URL` 设为 `https://api.deepseek.com/v1/`，
-> `LLM_MODEL` 设为 `deepseek-chat`，并**必须**再填 `TAVILY_API_KEY`（DeepSeek 无联网搜索）。
+> **国内用户推荐配置（一条龙，免 Google）：**
+> - `LLM_API_KEY` = 你的 Kimi Key（platform.moonshot.cn 申请）
+> - `LLM_BASE_URL` = `https://api.moonshot.cn/v1`
+> - `LLM_MODEL` = `kimi-k2.6`
+> - `SEARCH_MODE` = `kimi`（Kimi 内置 `$web_search` 联网搜索，自动多轮检索当天新闻）
+> - `SCKEY` = 你的 ServerChan 钥匙
+>
+> 想用 Gemini：Key 在 `https://aistudio.google.com/apikey`（国内常被墙，打不开就走上面 Kimi）。
+> 想用 DeepSeek：把 `LLM_BASE_URL` 设为 `https://api.deepseek.com/v1/`、`LLM_MODEL` 设为 `deepseek-chat`，
+> 并**必须**再填 `TAVILY_API_KEY`（DeepSeek 无内置联网搜索）。
 
 ### 3. 开启 GitHub Pages
 Settings → Pages → Build and deployment → Source 选 **Deploy from a branch**，
