@@ -1,0 +1,119 @@
+name: 报简说·每日生成与发布（云端全自动）
+
+# 定位：完全在 GitHub 云端运行，不依赖本机 WorkBuddy 客户端与本机网络。
+# 每天北京时间 07:00 自动：采集 → 渲染+审核 → (可选)公众号群发 → 手机页 → 部署 GitHub Pages → ServerChan 推送。
+# 计算免费（GitHub Free 私有库 2000 分钟/月，本流程约 2-3 分钟/天，远低于额度）。
+# 联网搜索与成稿由大模型 API 完成（默认 Gemini 免费额度，或 DeepSeek+Tavily，约 ¥0.1/月）。
+
+on:
+  schedule:
+    - cron: '0 23 * * *'        # UTC 23:00 = 北京时间 07:00
+  workflow_dispatch:            # 手动触发（Actions 页面 → Run workflow）
+
+permissions:
+  contents: write               # 提交产出（跨期查重 + 历史归档）
+  pages: write                  # 部署手机页到 GitHub Pages
+  id-token: write
+
+concurrency:
+  group: baojianshuo-daily
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出（含完整历史，供跨期互动查重）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install -r news_wechat/requirements.txt
+
+      - name: 重建 config.json（从 example + Secrets，绝不提交真实密钥）
+        env:
+          SCKEY: ${{ secrets.SCKEY }}
+          WX_APPID: ${{ secrets.WX_APPID }}
+          WX_APPSECRET: ${{ secrets.WX_APPSECRET }}
+        run: |
+          python - <<'PY'
+          import json, os
+          ex = 'news_wechat/config.example.json'
+          dst = 'news_wechat/config.json'
+          c = json.load(open(ex, encoding='utf-8'))
+          c['wechat']['sckey'] = os.environ.get('SCKEY', '')
+          aid = os.environ.get('WX_APPID', '')
+          sec = os.environ.get('WX_APPSECRET', '')
+          if aid:
+              c['wechat']['appid'] = aid
+          if sec:
+              c['wechat']['appsecret'] = sec
+          json.dump(c, open(dst, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+          print('已重建 config.json（sckey 注入:', bool(c['wechat']['sckey']), '）')
+          PY
+
+      - name: 采集 + 成稿（大模型联网搜索）
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          SEARCH_MODE: ${{ secrets.SEARCH_MODE }}
+        run: python news_wechat/collect.py
+
+      - name: 渲染 + 合规审核（BLOCK 会中断）
+        run: python news_wechat/render.py
+
+      - name: 注入公众号凭据并群发（可选，未配置则跳过）
+        env:
+          WX_APPID: ${{ secrets.WX_APPID }}
+          WX_APPSECRET: ${{ secrets.WX_APPSECRET }}
+        run: |
+          if [ -n "$WX_APPID" ]; then
+            python - <<'PY'
+          import json, os
+          p = 'news_wechat/config.json'
+          c = json.load(open(p, encoding='utf-8'))
+          c['wechat']['appid'] = os.environ['WX_APPID']
+          c['wechat']['appsecret'] = os.environ['WX_APPSECRET']
+          json.dump(c, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+          print('已注入 WX_APPID 凭据')
+          PY
+            python news_wechat/publish.py || echo "::warning::公众号群发失败，见上方日志"
+          else
+            echo "未配置 WX_APPID，跳过公众号群发（手机页+ServerChan 仍正常）"
+          fi
+
+      - name: 生成手机页
+        run: python news_wechat/mobile.py
+
+      - name: 部署手机页到 GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./news_wechat/mobile_dist
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "deploy: 手机页 ${{ github.run_id }}"
+
+      - name: 推送 ServerChan 汇报
+        env:
+          PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+          SCKEY: ${{ secrets.SCKEY }}
+        run: python news_wechat/push_sc.py "$PAGE_URL"
+
+      - name: 提交产出（供跨期查重与历史归档）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add news_wechat/output news_wechat/mobile_dist
+          git diff --cached --quiet || git commit -m "chore: 自动产出 $(date +%F)"
+          git push

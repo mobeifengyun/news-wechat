@@ -1,0 +1,14 @@
+# 真实密钥配置（含 ServerChan sckey），绝不入库；云端由 Secrets 重建
+news_wechat/config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 构建产物（云端重新生成，不必入库）
+news_wechat/mobile_dist/
+news_wechat/output/article_*.html
+news_wechat/output/_pending_catchup.json
+
+# WorkBuddy 本地数据
+.workbuddy/

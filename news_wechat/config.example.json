@@ -1,0 +1,35 @@
+{
+  "wechat": {
+    "appid": "请填入你的AppID",
+    "appsecret": "请填入你的AppSecret",
+    "author": "报简说",
+    "publish_mode": "mass_send",
+    "thumb_media_id": "",
+    "sckey": "请填入你的SCKEY（云端用 Secrets.SCKEY 注入，勿提交真实值）",
+    "open_comment": 1,
+    "only_fans_can_comment": 0
+  },
+  "article": {
+    "brand": "报简说",
+    "title_template": "报简说 | 每日消息早知道（{date}）",
+    "digest_template": "{date} 国际·财经·科技·民生·文体，几分钟看完今天该知道的事"
+  },
+  "sections": [
+    { "key": "world", "name": "国际新闻", "color": "#C0392B", "min": 3, "max": 6 },
+    { "key": "finance",  "name": "财经动态", "color": "#B7791F", "min": 3, "max": 6 },
+    { "key": "tech",     "name": "科技前沿", "color": "#1D6FA5", "min": 3, "max": 6 },
+    { "key": "society",  "name": "社会民生", "color": "#2F855A", "min": 3, "max": 6 },
+    { "key": "culture",  "name": "文体资讯", "color": "#6B46C1", "min": 3, "max": 6 }
+  ],
+  "hotlist_sites": [
+    "微博热搜", "百度热搜", "今日头条", "知乎热榜", "抖音热搜", "哔哩哔哩热榜",
+    "澎湃新闻", "腾讯新闻", "新浪热搜", "微信热搜", "酷安", "36氪"
+  ],
+  "source_whitelist": [
+    "新华社", "新华网", "人民日报", "人民网", "央视新闻", "央视网", "中国新闻网", "中新网",
+    "澎湃新闻", "第一财经", "证券时报", "上海证券报", "经济日报", "科技日报", "光明日报",
+    "中国青年报", "环球时报", "IT之家", "财联社", "界面新闻", "国家统计局", "中国政府网"
+  ],
+  "item_char_min": 40,
+  "item_char_max": 60
+}
