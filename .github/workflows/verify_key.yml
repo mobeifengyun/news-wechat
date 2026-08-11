@@ -1,0 +1,108 @@
+name: 密钥自检（Kimi / ServerChan）
+
+# 用途：随时手动点一下，10 秒内确认 GitHub Secrets 里的密钥还有没有效。
+# 只发一次极简请求，不采集、不生成、不推送真实内容，绝不干扰当日期次。
+# 场景：换了 Kimi Key 想立刻确认；或某天没收到推送，先来这里排查是不是密钥过期。
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_serverchan:
+        description: '同时测试 ServerChan（会给微信发一条测试消息）'
+        type: boolean
+        default: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 requests
+        run: pip install requests
+
+      - name: 检测大模型密钥（LLM_API_KEY）
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          python - <<'PY'
+          import os, sys, requests
+
+          key   = os.environ.get('LLM_API_KEY', '').strip()
+          base  = (os.environ.get('LLM_BASE_URL') or 'https://api.moonshot.cn/v1').strip().rstrip('/')
+          model = (os.environ.get('LLM_MODEL') or 'kimi-k2.6').strip()
+
+          print('=' * 46)
+          print('Base URL :', base)
+          print('Model    :', model)
+          print('Key      :', (key[:6] + '****' + key[-4:]) if len(key) > 12 else ('（空！Secret 没配）' if not key else '****'))
+          print('=' * 46)
+
+          if not key:
+              print('❌ LLM_API_KEY 是空的，去 Settings → Secrets and variables → Actions 补上。')
+              sys.exit(1)
+
+          try:
+              r = requests.post(
+                  f'{base}/chat/completions',
+                  headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+                  json={
+                      'model': model,
+                      'messages': [{'role': 'user', 'content': '回复两个字：正常'}],
+                      'max_tokens': 16,
+                      'temperature': 0,
+                  },
+                  timeout=60,
+              )
+          except Exception as e:
+              print('❌ 请求发不出去（网络或 Base URL 有问题）：', e)
+              sys.exit(1)
+
+          if r.status_code == 200:
+              try:
+                  msg = r.json()['choices'][0]['message']['content']
+              except Exception:
+                  msg = r.text[:120]
+              print(f'✅ 密钥有效，模型已回话：{msg!r}')
+              sys.exit(0)
+
+          print(f'❌ 失败：HTTP {r.status_code}')
+          print(r.text[:600])
+          if r.status_code == 401:
+              print('→ 401 = 密钥无效或已过期，去 platform.moonshot.cn 重新生成，更新 Secret LLM_API_KEY。')
+          elif r.status_code == 404:
+              print('→ 404 = 模型名或 Base URL 不对，检查 Secret LLM_MODEL / LLM_BASE_URL。')
+          elif r.status_code == 429:
+              print('→ 429 = 限流或余额不足，去平台后台看用量与账户余额。')
+          sys.exit(1)
+          PY
+
+      - name: 检测 ServerChan（可选，会真发一条微信）
+        if: ${{ inputs.test_serverchan }}
+        env:
+          SCKEY: ${{ secrets.SCKEY }}
+        run: |
+          python - <<'PY'
+          import os, sys, requests
+          key = os.environ.get('SCKEY', '').strip()
+          if not key:
+              print('❌ SCKEY 为空。')
+              sys.exit(1)
+          r = requests.post(
+              f'https://sctapi.ftqq.com/{key}.send',
+              data={'title': 'BaoJianShuo key check OK', 'desp': 'This is a test push from GitHub Actions.'},
+              timeout=30,
+          )
+          print('HTTP', r.status_code, r.text[:300])
+          sys.exit(0 if r.status_code == 200 and '"code":0' in r.text else 1)
+          PY
+
+      - name: 结论
+        if: always()
+        run: echo "自检结束。绿勾=密钥可用；红叉=看上面步骤的中文提示。"
