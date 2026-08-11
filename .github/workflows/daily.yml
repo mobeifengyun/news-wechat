@@ -60,7 +60,20 @@ jobs:
           print('已重建 config.json（sckey 注入:', bool(c['wechat']['sckey']), '）')
           PY
 
+      - name: 检查当日是否已生成（幂等短路，避免重复推送）
+        id: check
+        run: |
+          DAY=$(python -c "from datetime import datetime,timedelta,timezone; print(datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d'))")
+          echo "day=$DAY"
+          if [ -f "news_wechat/output/news_${DAY}.json" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "当日 $DAY 已存在，整轮跳过（含推送）"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 采集 + 成稿（大模型联网搜索）
+        if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
@@ -70,9 +83,11 @@ jobs:
         run: python news_wechat/collect.py
 
       - name: 渲染 + 合规审核（BLOCK 会中断）
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: python news_wechat/render.py
 
       - name: 注入公众号凭据并群发（可选，未配置则跳过）
+        if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           WX_APPID: ${{ secrets.WX_APPID }}
           WX_APPSECRET: ${{ secrets.WX_APPSECRET }}
@@ -93,9 +108,11 @@ jobs:
           fi
 
       - name: 生成手机页
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: python news_wechat/mobile.py
 
       - name: 部署手机页到 GitHub Pages
+        if: ${{ steps.check.outputs.skip != 'true' }}
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -105,12 +122,14 @@ jobs:
           commit_message: "deploy: 手机页 ${{ github.run_id }}"
 
       - name: 推送 ServerChan 汇报
+        if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
           SCKEY: ${{ secrets.SCKEY }}
         run: python news_wechat/push_sc.py "$PAGE_URL"
 
       - name: 提交产出（供跨期查重与历史归档）
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
