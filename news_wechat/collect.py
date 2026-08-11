@@ -356,7 +356,8 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors):
 
 
 def main():
-    day = sys.argv[1] if len(sys.argv) > 1 else date.today().isoformat()
+    tz = timezone(timedelta(hours=8))
+    day = sys.argv[1] if len(sys.argv) > 1 else datetime.now(tz).strftime("%Y-%m-%d")
     cfg = load_cfg()
     out_path = os.path.join(BASE, "output", f"news_{day}.json")
 
