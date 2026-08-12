@@ -175,11 +175,12 @@ def kimi_chat(system, user, base_url, api_key, model):
         body = {
             "model": model,
             "messages": messages,
-            "temperature": 0.7,
             "response_format": {"type": "json_object"},
             "tools": tools,
             "thinking": {"type": "disabled"},  # $web_search 必须禁用 thinking
         }
+        # Kimi K2.6/K2.5 对 temperature/top_p 等采样参数有固定约束，非思考模式固定 0.6，
+        # 传其他值会 400。这里不传，让平台使用默认值。
         r = requests.post(
             url,
             headers=headers,
