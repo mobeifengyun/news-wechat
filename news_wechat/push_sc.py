@@ -22,6 +22,11 @@ def main():
         sys.exit(1)
     url = sys.argv[1]
     day = sys.argv[2] if len(sys.argv) > 2 else date.today().isoformat()
+    # 每天 URL 加日期参数，避免微信内置浏览器直接复用前一天缓存
+    if "?" in url:
+        url = f"{url}&d={day.replace('-', '')}"
+    else:
+        url = f"{url}?d={day.replace('-', '')}"
 
     with open(os.path.join(BASE, "config.json"), "r", encoding="utf-8") as f:
         cfg = json.load(f)
