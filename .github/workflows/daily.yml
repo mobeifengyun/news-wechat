@@ -136,3 +136,14 @@ jobs:
           git add news_wechat/output news_wechat/mobile_dist
           git diff --cached --quiet || git commit -m "chore: 自动产出 $(date +%F)"
           git push
+
+      - name: 上传采集诊断（失败可查根因）
+        if: always()
+        run: |
+          if [ -f news_wechat/output/_collect_error.txt ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add news_wechat/output/_collect_error.txt
+            git commit -m "debug: 采集诊断 $(date +%FT%H%M%S)" || echo "无变更"
+            git push
+          fi
