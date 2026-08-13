@@ -332,7 +332,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "生成每日早报的结构化数据。必须遵守以下铁律：\n"
         "1. 所有新闻事实只能引用白名单媒体，绝不使用白名单以外的任何来源"
         "（含境外媒体、自媒体、营销号）。白名单：" + wl + "。\n"
-        "2. 每条新闻摘要严格 40–60 个汉字（含标点），用客观陈述句，不评论、不引申。\n"
+        "2. 每条新闻摘要严格 35–55 个汉字（含标点），用客观陈述句，不评论、不引申；宁可稍详勿过简。\n"
         "3. 来源 source 必须是白名单中的某个媒体名，且确实报道过该事。\n"
         "4. 热点榜单 hotspot 每条只写话题标题（简短），标注 site（只能是热榜站点之一）。\n"
         "5. 每日微语 quote 须为原创或公版励志短句，不得抄袭任何「微语报」「早安语」原文。\n"
@@ -479,7 +479,7 @@ def main():
     data = None
     last_err = ""
     last_raw = ""
-    for attempt in range(3):
+    for attempt in range(5):
         sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
         print(f"第 {attempt+1} 次生成…")
         try:
