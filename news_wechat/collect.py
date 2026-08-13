@@ -39,15 +39,24 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
 
 # 白名单来源 -> 检索域名（Tavily include_domains 用，从根上锁死非白名单来源）
+# 覆盖范围刻意做宽：央媒（新华社/人民日报/央视/总台/央广/国际在线）+ 财经（一财/证券时报/每经/21世纪/中证报/经观）
+# + 科技（科技日报/IT之家/钛媒体/虎嗅/雷锋网/量子位/36氪）+ 社会（澎湃/新京报/北京日报/上观/南方+/上游）
+# + 文体（中国体育报/文旅部）+ 民生（健康报/中国教育报/农民日报/教育部）等，减少「新闻遗漏」。
 WL_DOMAINS = {
     "新华社": ["xinhuanet.com", "news.cn"],
     "新华网": ["xinhuanet.com", "news.cn"],
     "人民日报": ["people.com.cn"],
     "人民网": ["people.com.cn"],
-    "央视新闻": ["cctv.com", "cntv.cn"],
-    "央视网": ["cctv.com", "cntv.cn"],
+    "央视新闻": ["cctv.com", "cntv.cn", "cctv.cn"],
+    "央视网": ["cctv.com", "cntv.cn", "cctv.cn"],
+    "中央广播电视总台": ["cctv.com", "cntv.cn", "cctv.cn"],
+    "朝闻天下": ["cctv.com", "cntv.cn", "cctv.cn"],
+    "央广网": ["cnr.cn"],
+    "国际在线": ["cri.cn"],
     "中国新闻网": ["chinanews.com.cn"],
     "中新网": ["chinanews.com.cn"],
+    "中国日报": ["chinadaily.com.cn"],
+    "参考消息": ["cankaoxiaoxi.com"],
     "澎湃新闻": ["thepaper.cn"],
     "第一财经": ["yicai.com"],
     "证券时报": ["stcn.com"],
@@ -57,9 +66,32 @@ WL_DOMAINS = {
     "光明日报": ["gmw.cn"],
     "中国青年报": ["youth.cn"],
     "环球时报": ["huanqiu.com", "globaltimes.cn"],
+    "环球网": ["huanqiu.com", "globaltimes.cn"],
     "IT之家": ["ithome.com"],
     "财联社": ["cailianpress.com"],
     "界面新闻": ["jiemian.com"],
+    "中新经纬": ["jwview.com"],
+    "21世纪经济报道": ["21jingji.com"],
+    "每日经济新闻": ["nbd.com.cn"],
+    "新京报": ["bjnews.com.cn"],
+    "北京日报": ["beijingdaily.com.cn"],
+    "上观新闻": ["jfdaily.com"],
+    "南方plus": ["southcn.com"],
+    "上游新闻": ["cqcb.com"],
+    "钛媒体": ["tmtpost.com"],
+    "虎嗅": ["huxiu.com"],
+    "雷锋网": ["leiphone.com"],
+    "量子位": ["qbitai.com"],
+    "36氪": ["36kr.com"],
+    "中国证券报": ["cs.com.cn"],
+    "经济观察报": ["eeo.com.cn"],
+    "国家体育总局": ["sport.gov.cn"],
+    "中国体育报": ["sports.cn"],
+    "文旅部": ["mct.gov.cn"],
+    "教育部": ["moe.gov.cn"],
+    "健康报": ["jkb.com.cn"],
+    "中国教育报": ["jyb.cn"],
+    "农民日报": ["farmer.com.cn"],
     "国家统计局": ["stats.gov.cn"],
     "中国政府网": ["gov.cn"],
 }
@@ -293,7 +325,7 @@ def validate(data, cfg):
         if inter.get("cards"):
             errors.append("[互动] 同时存在 card 与 cards，请只保留单个 card")
         t = card.get("type")
-        if t not in ("guess", "code", "fill", "echo", "stance"):
+        if t not in ("guess", "code", "fill", "echo", "stance", "ask"):
             errors.append(f"[互动] 卡型「{t}」非法")
         else:
             if not card.get("topic"):
@@ -332,16 +364,21 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "生成每日早报的结构化数据。必须遵守以下铁律：\n"
         "1. 所有新闻事实只能引用白名单媒体，绝不使用白名单以外的任何来源"
         "（含境外媒体、自媒体、营销号）。白名单：" + wl + "。\n"
-        "2. 每条新闻摘要严格 35–55 个汉字（含标点），用客观陈述句，不评论、不引申；宁可稍详勿过简。\n"
+        "2. 每条新闻摘要严格 35–55 个汉字（含标点），用客观陈述句，不评论、不引申；宁可稍详勿过简。"
+        "组稿须按「早间新闻晨读（如央视《朝闻天下》式）」思路覆盖当天要闻：国内、国际、财经、科技、民生、文体各大类都要有代表，"
+        "重大事件宁多勿漏，不要只盯着一两个话题。\n"
         "3. 来源 source 必须是白名单中的某个媒体名，且确实报道过该事。\n"
         "4. 热点榜单 hotspot 每条只写话题标题（简短），标注 site（只能是热榜站点之一）。\n"
         "5. 每日微语 quote 须为原创或公版励志短句，不得抄袭任何「微语报」「早安语」原文。\n"
-        "6. 互动板块 interaction 每期只出 1 个问题，靠读者打字参与，"
-        "禁止出现「点赞/在看/转发/分享/抽奖/奖品」等词，绝不做成按钮。\n"
-        "7. 今日一问的安全选题区：影视综艺票房收视、体育赛事竞猜、天气季节体感、"
-        "饮食口味、出行见闻、老物件怀旧、科技产品体验、方言俗语。"
-        "严禁拿时政外交、军事、灾情伤亡、民生政策抱怨（油价房价社保养老医保裁员物价）、"
-        "投资荐股、医疗健康建议、点名个人是非、性别地域彩礼等群体对立话题来提问。\n"
+        "6. 互动板块 interaction 每期只出 1 个「高质量」问题，靠读者打字留言参与，"
+        "绝不做成按钮、绝不允许出现「点赞/在看/转发/分享/抽奖/奖品」等词。"
+        "好问题 = 有悬念能勾起好奇 + 有共鸣让人想说 + 零门槛一句话能答 + 值得晒（读者愿意发朋友圈那种）。"
+        "lead 与 closing 要有温度，像朋友聊天而非官宣；topic 要有钩子（悬念/反差/共鸣），不要平铺直叙。\n"
+        "7. 今日一问优选「有讨论欲、低争议」的选题：影视综艺票房收视、体育赛事竞猜、"
+        "天气季节体感与出行、饮食口味与家乡味、老物件怀旧、科技产品真机体验、方言俗语、"
+        "旅行见闻、童年记忆、养花养宠。严禁拿时政外交、军事、灾情伤亡、"
+        "民生政策抱怨（油价房价社保养老医保裁员物价）、投资荐股、医疗健康建议、"
+        "点名个人是非、性别地域阶层对立等易翻车话题来提问。\n"
         "8. 只输出符合指定 schema 的 JSON，不要任何解释文字。\n"
         "9. 用户可能提供一份「公众号参考素材」（仅供选题方向与表述启发）。"
         "你只能用它发现哪些话题值得今日报道、借鉴其栏目编排思路；"
@@ -352,12 +389,18 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
 
     user_prompt = (
         f"请生成 {day}（{date_cn}）的日报数据。\n\n"
-        f"五个板块（顺序与名称必须严格一致，每板块 3–6 条）：{sec_names}。\n"
-        f"各板块检索关键词建议：国际新闻=国际 外交部 环球；财经动态=财经 股市 央行；"
-        f"科技前沿=科技 AI 芯片；社会民生=社会 民生 政策；文体资讯=文体 影视 体育。\n\n"
+        f"各板块（顺序与名称必须严格一致，每板块 4–6 条）：{sec_names}。\n"
+        f"请按「早间新闻晨读」思路组稿：覆盖当天国内外要闻、财经、科技、民生、文体，尽量不遗漏重大事件；"
+        f"每个板块挑当天最具关注度、最值得读者知道的 4–6 条。\n"
+        f"各板块检索/选题方向：国内要闻=今日国内大事·政策发布·重大工程·航天科技成就；"
+        f"国际新闻=国际 外交部 环球；财经动态=财经 股市 央行 楼市；科技前沿=AI 芯片 航天 新能源；"
+        f"社会民生=民生 教育 医疗 就业 暖新闻；文体资讯=影视 体育 音乐 文博。\n\n"
         f"热点榜单站点（site 只能取这些）：{sites}。\n\n"
         f"上一期互动卡型是「{prev_type or '无'}」，本期必须换一种卡型"
-        f"（可选：guess 盲猜 / code 打卡 / fill 填空 / echo 上期揭晓 / stance 站队）。\n\n"
+        f"（可选：guess 盲猜 / code 打卡 / fill 填空 / echo 上期揭晓 / stance 站队 / ask 开放式闲聊）。\n"
+        f"互动卡质量红线：①给一个让人想立刻回答的具体场景；②给模板或格式降低参与门槛；"
+        f"③topic 要有钩子（例：fill「我家的立秋第一餐是__，你那儿吃什么？」远比「你今天吃了什么」好；"
+        f"guess「今年暑期档总票房你猜破__亿了吗？」远比「票房多少」好）；④lead/closing 有温度像聊天。\n\n"
     )
     if search_ctx:
         user_prompt += (
@@ -379,7 +422,8 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         '  "greeting": "一句早安问候（≤20字）",\n'
         '  "quote": "原创/公版励志微语（≤30字）",\n'
         '  "sections": [\n'
-        '    {"name": "国际新闻", "items": [{"text": "40-60字摘要", "source": "央视新闻"}]},\n'
+        '    {"name": "国内要闻", "items": [{"text": "40-60字摘要", "source": "央视新闻"}]},\n'
+        '    {"name": "国际新闻", "items": [...]},\n'
         '    {"name": "财经动态", "items": [...]},\n'
         '    {"name": "科技前沿", "items": [...]},\n'
         '    {"name": "社会民生", "items": [...]},\n'
@@ -399,6 +443,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         '- fill:  {"type":"fill","topic":"…","template":"我家乡在__，今天__度。","hint":"…"}\n'
         '- echo:  {"type":"echo","topic":"上期答案揭晓","answer":"上期正确答案是…","note":"…"}\n'
         '- stance:{"type":"stance","topic":"…","left":"甲","right":"乙","hint":"…"}\n'
+        '- ask:   {"type":"ask","topic":"一个让人想聊的开放问题","hint":"评论区聊聊你的看法…"}\n'
     )
     if errors:
         user_prompt += (
@@ -459,9 +504,10 @@ def main():
     elif use_tavily:
         print("检索模式：Tavily（限定白名单域名）")
         queries = [
-            "今日国际新闻 新华社 央视", "今日财经动态 证券时报 第一财经",
-            "今日科技前沿 AI 芯片 科技日报", "今日社会民生 澎湃新闻",
-            "今日文体资讯 影视 体育", "今日热搜 微博 抖音 百度",
+            "今日国内要闻 新华社 央视 人民日报", "今日国际新闻 新华社 央视 环球",
+            "今日财经动态 证券时报 第一财经 每日经济新闻", "今日科技前沿 AI 芯片 科技日报 量子位",
+            "今日社会民生 澎湃新闻 新京报", "今日文体资讯 影视 体育 音乐",
+            "今日热搜 微博 抖音 百度",
         ]
         for q in queries:
             try:
