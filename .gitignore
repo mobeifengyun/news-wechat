@@ -10,5 +10,8 @@ news_wechat/mobile_dist/
 news_wechat/output/article_*.html
 news_wechat/output/_pending_catchup.json
 
+# 公众号参考素材（用户手动喂入的原文，含第三方内容，绝不入库；仅 README 跟踪）
+news_wechat/seeds/*.txt
+
 # WorkBuddy 本地数据
 .workbuddy/
