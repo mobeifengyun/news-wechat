@@ -134,8 +134,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add news_wechat/output news_wechat/mobile_dist
-          git diff --cached --quiet || git commit -m "chore: 自动产出 $(date +%F)"
-          git push
+          if git diff --cached --quiet; then
+            echo "无产出变更，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: 自动产出 $(date +%F)"
+          for i in 1 2 3; do
+            git pull --rebase origin main || true
+            if git push origin main; then
+              echo "提交产出成功"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::提交产出失败（main 可能有并发提交，请手动同步 output）"; exit 1
 
       - name: 上传采集诊断（失败可查根因）
         if: always()
@@ -144,6 +155,14 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add news_wechat/output/_collect_error.txt
-            git commit -m "debug: 采集诊断 $(date +%FT%H%M%S)" || echo "无变更"
-            git push
+            if git diff --cached --quiet; then
+              echo "诊断文件无变更，跳过"
+            else
+              git commit -m "debug: 采集诊断 $(date +%FT%H%M%S)" || true
+              for i in 1 2 3; do
+                git pull --rebase origin main || true
+                if git push origin main; then break; fi
+                sleep 5
+              done
+            fi
           fi
