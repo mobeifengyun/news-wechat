@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -163,20 +164,43 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
     }
     if tools:
         body["tools"] = tools
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        timeout=150,
-    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
 
 # ---------------- Kimi / Moonshot 联网搜索 ----------------
+def _post_with_retry(url, headers, data, timeout=150, max_retry=5):
+    """带 429 限流退避的 POST。Kimi 免费档 RPM 很低，一次采集会连发多轮请求，
+    必须遇到 429 就按 Retry-After 等待后重试，否则整轮失败。"""
+    import requests
+    for i in range(max_retry):
+        try:
+            r = requests.post(url, headers=headers, data=data, timeout=timeout)
+        except requests.RequestException as e:
+            if i < max_retry - 1:
+                print(f"  ⏳ 网络异常 {e}，5s 后重试 ({i+1}/{max_retry})")
+                time.sleep(5)
+                continue
+            raise
+        if r.status_code == 429:
+            wait = 20
+            try:
+                wait = int(r.headers.get("Retry-After", 20))
+            except Exception:
+                pass
+            wait = min(max(wait, 15), 90)
+            print(f"  ⏳ 429 限流，等 {wait}s 重试 ({i+1}/{max_retry})")
+            time.sleep(wait)
+            continue
+        return r
+    return r
+
+
 def kimi_chat(system, user, base_url, api_key, model):
     """Kimi/Moonshot 内置 $web_search 工具联网搜索。
 
@@ -201,12 +225,7 @@ def kimi_chat(system, user, base_url, api_key, model):
         }
         # Kimi K2.6/K2.5 对 temperature/top_p 等采样参数有固定约束，非思考模式固定 0.6，
         # 传其他值会 400。这里不传，让平台使用默认值。
-        r = requests.post(
-            url,
-            headers=headers,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            timeout=150,
-        )
+        r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
         r.raise_for_status()
         msg = r.json()["choices"][0]["message"]
         if not msg.get("tool_calls"):
@@ -223,6 +242,7 @@ def kimi_chat(system, user, base_url, api_key, model):
                 "tool_call_id": tc["id"],
                 "content": tc["function"]["arguments"],
             })
+        time.sleep(6)  # 多轮之间留间隔，避免触发 Kimi 免费档 RPM 限流
     return None  # 超过轮次上限仍未出最终答案
 
 
