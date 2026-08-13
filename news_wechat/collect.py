@@ -65,6 +65,28 @@ WL_DOMAINS = {
 ALL_WL_DOMAINS = sorted({d for v in WL_DOMAINS.values() for d in v})
 WHITELIST = list(WL_DOMAINS.keys())
 
+# 用户手动喂入的「公众号参考素材」目录（仅作选题启发，非信源）
+SEED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seeds")
+
+
+def load_seed(day):
+    """读取当日公众号参考素材。优先级：seeds/<date>.txt > seeds/latest.txt。
+    找不到或为空则返回空串（采集流程降级为纯白名单模式，不报错）。"""
+    cands = [
+        os.path.join(SEED_DIR, f"{day}.txt"),
+        os.path.join(SEED_DIR, "latest.txt"),
+    ]
+    for p in cands:
+        if os.path.exists(p):
+            try:
+                txt = open(p, encoding="utf-8").read().strip()
+                if txt:
+                    return txt
+            except Exception:
+                pass
+    return ""
+
+
 DEFAULT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_MODEL = "gemini-2.5-flash"
 
@@ -137,7 +159,6 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "temperature": 0.7,
         "response_format": {"type": "json_object"},
     }
     if tools:
@@ -280,7 +301,7 @@ def audit_block(data, day):
         return 0
 
 
-def build_prompt(day, cfg, prev_type, search_ctx, errors):
+def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     d = date.fromisoformat(day)
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     sec_names = "、".join(s["name"] for s in cfg["sections"])
@@ -302,7 +323,12 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors):
         "饮食口味、出行见闻、老物件怀旧、科技产品体验、方言俗语。"
         "严禁拿时政外交、军事、灾情伤亡、民生政策抱怨（油价房价社保养老医保裁员物价）、"
         "投资荐股、医疗健康建议、点名个人是非、性别地域彩礼等群体对立话题来提问。\n"
-        "8. 只输出符合指定 schema 的 JSON，不要任何解释文字。"
+        "8. 只输出符合指定 schema 的 JSON，不要任何解释文字。\n"
+        "9. 用户可能提供一份「公众号参考素材」（仅供选题方向与表述启发）。"
+        "你只能用它发现哪些话题值得今日报道、借鉴其栏目编排思路；"
+        "最终每一条新闻的事实仍须来自上面的白名单媒体检索结果，"
+        "source 必须是白名单媒体名，绝不可把公众号或其素材当作信源、"
+        "绝不可照搬其原文原句。"
     )
 
     user_prompt = (
@@ -318,6 +344,14 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors):
         user_prompt += (
             "以下是联网检索到的白名单媒体素材（仅可据此成稿，不得引用素材之外的信息）：\n"
             + "\n\n".join(search_ctx)[:6000]
+            + "\n\n"
+        )
+    if seed:
+        user_prompt += (
+            "【用户提供的公众号参考素材（仅供选题方向与表述启发，"
+            "不得作为信源、不得照搬原文原句）】\n"
+            + seed[:4000]
+            + ("\n（素材已截断）" if len(seed) > 4000 else "")
             + "\n\n"
         )
     user_prompt += (
@@ -382,6 +416,9 @@ def main():
     search_mode = os.environ.get("SEARCH_MODE", "auto").lower()
 
     prev_type = prev_card_type(day)
+    seed = load_seed(day)
+    if seed:
+        print(f"检测到公众号参考素材：{len(seed)} 字（仅作选题启发，事实仍以白名单为准）")
     print(f"采集 {day}（上期卡型={prev_type or '无'}）模型={model}")
 
     search_ctx = []
@@ -416,7 +453,7 @@ def main():
     errors = []
     data = None
     for attempt in range(3):
-        sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors)
+        sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
         print(f"第 {attempt+1} 次生成…")
         try:
             if use_kimi:
