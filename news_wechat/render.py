@@ -25,10 +25,12 @@ def validate(data, cfg):
     warnings = []
     wl = set(cfg["source_whitelist"])
     cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
+    cfg_minmax = {s["name"]: (s.get("min", 3), s.get("max", 6)) for s in cfg["sections"]}
     for sec in data["sections"]:
         items = sec.get("items", [])
-        if not (3 <= len(items) <= 6):
-            warnings.append(f"[{sec['name']}] 条数 {len(items)} 不在 3-6 范围")
+        lo, hi = cfg_minmax.get(sec["name"], (3, 6))
+        if not (lo <= len(items) <= hi):
+            warnings.append(f"[{sec['name']}] 条数 {len(items)} 不在 {lo}-{hi} 范围")
         for i, it in enumerate(items, 1):
             n = len(it["text"])
             if not (cmin <= n <= cmax):
