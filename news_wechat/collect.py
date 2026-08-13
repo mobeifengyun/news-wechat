@@ -196,7 +196,6 @@ def kimi_chat(system, user, base_url, api_key, model):
         body = {
             "model": model,
             "messages": messages,
-            "response_format": {"type": "json_object"},
             "tools": tools,
             "thinking": {"type": "disabled"},  # $web_search 必须禁用 thinking
         }
@@ -395,6 +394,12 @@ def main():
     day = sys.argv[1] if len(sys.argv) > 1 else datetime.now(tz).strftime("%Y-%m-%d")
     cfg = load_cfg()
     out_path = os.path.join(BASE, "output", f"news_{day}.json")
+    err_path = os.path.join(BASE, "output", "_collect_error.txt")
+    if os.path.exists(err_path):
+        try:
+            os.remove(err_path)
+        except Exception:
+            pass
 
     # 幂等：当日已存在且通过审核则跳过，避免重复生成/重复推送
     if os.path.exists(out_path):
@@ -452,6 +457,8 @@ def main():
 
     errors = []
     data = None
+    last_err = ""
+    last_raw = ""
     for attempt in range(3):
         sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
         print(f"第 {attempt+1} 次生成…")
@@ -460,12 +467,14 @@ def main():
                 raw = kimi_chat(sys_p, usr_p, base_url, api_key, model)
             else:
                 raw = llm_chat(sys_p, usr_p, base_url, api_key, model, tools)
+            last_raw = raw
             # 容错：去掉可能包裹的 ```json ``` 标记
             m = re.search(r"\{.*\}", raw, re.S)
             if m:
                 raw = m.group(0)
             cand = json.loads(raw)
         except Exception as e:
+            last_err = str(e)
             print("  解析失败:", e)
             errors = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
             continue
@@ -482,6 +491,17 @@ def main():
         break
 
     if not data:
+        try:
+            diag = (
+                f"date={day}\nuse_kimi={use_kimi} model={model}\n"
+                f"last_err={last_err}\nlast_raw={(last_raw or '')[:1500]}\n"
+                f"errors={errors}\n"
+            )
+            with open(err_path, "w", encoding="utf-8") as f:
+                f.write(diag)
+            print("已写诊断到", err_path)
+        except Exception:
+            pass
         print("ERROR: 3 次尝试仍未生成合规内容：", errors)
         sys.exit(1)
 
