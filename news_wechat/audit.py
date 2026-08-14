@@ -220,6 +220,24 @@ def audit_data(data, day=None):
             if m:
                 findings.append((level, cat, where, m.group(0), text, advice))
 
+    # 时效性兜底：新闻正文出现明显早于目标年份的年份字样 → 疑似旧闻
+    if day:
+        try:
+            target_year = int(day[:4])
+        except Exception:
+            target_year = None
+        if target_year:
+            for where, text in texts:
+                if not text or where.startswith("互动"):
+                    continue
+                for ystr in re.findall(r"((?:19|20)\d{2})年", text):
+                    yv = int(ystr)
+                    if yv <= target_year - 1:
+                        findings.append((
+                            "WARN", "疑似旧闻", where, f"{ystr}年", text,
+                            f"条文中出现 {ystr}年，早于目标日期 {day} 的年份，疑似旧闻/周年回顾，请核实报道时间",
+                        ))
+
     # 互动板块红线单独强校验
     inter = data.get("interaction") or {}
     for where, text in texts:
