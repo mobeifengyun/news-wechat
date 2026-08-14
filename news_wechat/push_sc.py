@@ -9,7 +9,7 @@
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -21,7 +21,7 @@ def main():
         print("用法: python push_sc.py <手机页链接> [YYYY-MM-DD]")
         sys.exit(1)
     url = sys.argv[1]
-    day = sys.argv[2] if len(sys.argv) > 2 else date.today().isoformat()
+    day = sys.argv[2] if len(sys.argv) > 2 else datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     # 每天 URL 加日期参数，避免微信内置浏览器直接复用前一天缓存
     if "?" in url:
         url = f"{url}&d={day.replace('-', '')}"
