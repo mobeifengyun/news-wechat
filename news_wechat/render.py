@@ -7,7 +7,7 @@
 import json
 import sys
 import os
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from audit import audit_data, format_report, interaction_cards
 
@@ -286,7 +286,7 @@ def render_interaction(data):
 
 
 def main():
-    day = sys.argv[1] if len(sys.argv) > 1 else date.today().isoformat()
+    day = sys.argv[1] if len(sys.argv) > 1 else datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     cfg = load(os.path.join(BASE, "config.json"))
     src = os.path.join(BASE, "output", f"news_{day}.json")
     if not os.path.exists(src):
