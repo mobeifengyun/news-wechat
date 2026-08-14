@@ -161,7 +161,7 @@ def prev_card_type(day):
 
 
 # ---------------- 检索 ----------------
-def tavily_search(query, api_key, max_results=5):
+def tavily_search(query, api_key, max_results=5, days=2):
     import requests
     r = requests.post(
         "https://api.tavily.com/search",
@@ -170,7 +170,10 @@ def tavily_search(query, api_key, max_results=5):
             "query": query,
             "max_results": max_results,
             "include_domains": ALL_WL_DOMAINS,
-            "search_depth": "basic",
+            "search_depth": "advanced",
+            "topic": "news",
+            "days": days,
+            "time_range": "day",
         },
         timeout=30,
     )
@@ -386,9 +389,19 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "source 必须是白名单媒体名，绝不可把公众号或其素材当作信源、"
         "绝不可照搬其原文原句。"
     )
+    sys_prompt += (
+        f"\n10. 时效性铁律（最高优先级）：所有新闻必须是「{day}」当天（或前一日 24–48 小时内）"
+        f"由白名单媒体新近发布/滚动报道的事件，报道日期不得早于 {day} 超过 2 天。"
+        f"严禁采用周年纪念、历史回顾、旧闻重发、科普百科、以及在 {day} 之前就已发生且已被广泛报道过的「旧热点」。"
+        f"若联网检索只得到旧闻、或某条结果无法确认其报道日期在 {day} 前后，宁可该板块少写几条，"
+        f"也绝不允许把旧闻当成今日新闻塞进来——这是硬红线，违反即作废重生成。"
+    )
 
     user_prompt = (
         f"请生成 {day}（{date_cn}）的日报数据。\n\n"
+        f"【时效性红线】本日报只收录 {date_cn} 当天（及前一日）发生的「新近新闻」。"
+        f"不要写早于 {day} 超过 2 天的旧闻、周年纪念、历史回顾或旧热点重发；"
+        f"每条新闻请先在脑中确认其报道日期在 {date_cn} 前后，无法确认日期的旧闻一律不采用。\n\n"
         f"各板块（顺序与名称必须严格一致，每板块 4–6 条）：{sec_names}。\n"
         f"请按「早间新闻晨读」思路组稿：覆盖当天国内外要闻、财经、科技、民生、文体，尽量不遗漏重大事件；"
         f"每个板块挑当天最具关注度、最值得读者知道的 4–6 条。\n"
@@ -502,16 +515,18 @@ def main():
             model = "kimi-k2.6"
         print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model}")
     elif use_tavily:
-        print("检索模式：Tavily（限定白名单域名）")
+        print("检索模式：Tavily（限定白名单域名 + 近 2 日新闻）")
+        _d = date.fromisoformat(day)
+        _dc = f"{_d.year}年{_d.month}月{_d.day}日"
         queries = [
-            "今日国内要闻 新华社 央视 人民日报", "今日国际新闻 新华社 央视 环球",
-            "今日财经动态 证券时报 第一财经 每日经济新闻", "今日科技前沿 AI 芯片 科技日报 量子位",
-            "今日社会民生 澎湃新闻 新京报", "今日文体资讯 影视 体育 音乐",
-            "今日热搜 微博 抖音 百度",
+            f"{_dc} 国内要闻 新华社 央视 人民日报", f"{_dc} 国际新闻 新华社 央视 环球",
+            f"{_dc} 财经动态 证券时报 第一财经 每日经济新闻", f"{_dc} 科技前沿 AI 芯片 科技日报 量子位",
+            f"{_dc} 社会民生 澎湃新闻 新京报", f"{_dc} 文体资讯 影视 体育 音乐",
+            f"{_dc} 热搜 微博 抖音 百度",
         ]
         for q in queries:
             try:
-                search_ctx += tavily_search(q, tavily_key, max_results=4)
+                search_ctx += tavily_search(q, tavily_key, max_results=4, days=2)
             except Exception as e:
                 print("  Tavily 检索失败:", e)
     else:
