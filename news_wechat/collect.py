@@ -98,6 +98,73 @@ WL_DOMAINS = {
 ALL_WL_DOMAINS = sorted({d for v in WL_DOMAINS.values() for d in v})
 WHITELIST = list(WL_DOMAINS.keys())
 
+# ---------------- 节日 / 节气识别（驱动「今日一问」应景出题） ----------------
+# 优先用 lunar_python 拿精确节气与农历节日；本地或无该库时回退到内置公历节日表 + 节气近似表。
+GREGORIAN_FESTIVALS = {
+    (1, 1): "元旦", (2, 14): "情人节", (3, 8): "妇女节", (3, 12): "植树节",
+    (3, 15): "消费者权益日", (4, 5): "清明节", (5, 1): "劳动节", (5, 4): "青年节",
+    (6, 1): "儿童节", (7, 1): "建党节", (8, 1): "建军节", (9, 3): "抗战胜利日",
+    (9, 10): "教师节", (10, 1): "国庆节", (12, 24): "平安夜", (12, 25): "圣诞节",
+}
+# 24 节气公历近似日期（21 世纪常用值，个别年份 ±1 天；仅作无 lunar_python 时的兜底）
+JIEQI_APPROX = {
+    "小寒": (1, 6), "大寒": (1, 20), "立春": (2, 4), "雨水": (2, 19),
+    "惊蛰": (3, 6), "春分": (3, 21), "清明": (4, 5), "谷雨": (4, 20),
+    "立夏": (5, 6), "小满": (5, 21), "芒种": (6, 6), "夏至": (6, 21),
+    "小暑": (7, 7), "大暑": (7, 23), "立秋": (8, 8), "处暑": (8, 23),
+    "白露": (9, 8), "秋分": (9, 23), "寒露": (10, 8), "霜降": (10, 24),
+    "立冬": (11, 8), "小雪": (11, 22), "大雪": (12, 7), "冬至": (12, 22),
+}
+
+
+def festival_of(d):
+    """返回当天节日/节气名（可能多个，用「、」连接）；无则返回空串。"""
+    names = []
+    # 浮动节日（任何情况下都计算）：母亲节(5月第2周日)/父亲节(6月第3周日)/感恩节(11月第4周四)
+    if d.month == 5 and d.weekday() == 6 and 8 <= d.day <= 14:
+        names.append("母亲节")
+    if d.month == 6 and d.weekday() == 6 and 15 <= d.day <= 21:
+        names.append("父亲节")
+    if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
+        names.append("感恩节")
+    try:
+        from lunar_python import Lunar, Solar
+        solar = Solar.fromYmd(d.year, d.month, d.day)
+        l = Lunar.fromSolar(solar)
+        try:
+            jq = l.getJieQi()
+            if jq:
+                names.append(jq)
+        except Exception:
+            pass
+        try:
+            for f in (l.getFestivals() or []):
+                if f:
+                    names.append(f)
+        except Exception:
+            pass
+        try:
+            for f in (solar.getFestivals() or []):
+                if f:
+                    names.append(f)
+        except Exception:
+            pass
+    except Exception:
+        # 库缺失：回退内置公历节日表 + 近似节气表
+        g = GREGORIAN_FESTIVALS.get((d.month, d.day))
+        if g:
+            names.append(g)
+        for nm, (m, dd) in JIEQI_APPROX.items():
+            if (m, dd) == (d.month, d.day):
+                names.append(nm)
+    seen, out = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return "、".join(out)
+
+
 # 用户手动喂入的「公众号参考素材」目录（仅作选题启发，非信源）
 SEED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seeds")
 
@@ -131,9 +198,16 @@ def load_cfg():
 
 def lunar_of(d):
     try:
-        from lunar_python import Converter
-        c = Converter.Lunar.fromSolar(d.year, d.month, d.day)
-        return f"{'闰' if c.isLeap else ''}{c.month}月{c.day}日"
+        from lunar_python import Lunar, Solar
+        l = Lunar.fromSolar(Solar.fromYmd(d.year, d.month, d.day))
+        m, day = l.getMonth(), l.getDay()
+        leap = ""
+        try:
+            if l.getLeapMonth() == m:
+                leap = "闰"
+        except Exception:
+            pass
+        return f"{leap}{m}月{day}日"
     except Exception:
         return ""
 
@@ -357,6 +431,7 @@ def audit_block(data, day):
 
 def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     d = date.fromisoformat(day)
+    theme = festival_of(d)
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     sec_names = "、".join(s["name"] for s in cfg["sections"])
     wl = "、".join(cfg["source_whitelist"])
@@ -419,6 +494,13 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"ask「您手机里最常用的是哪个 APP？评论区聊聊」远比「您会用智能手机吗」好；"
         f"guess「您家今年中秋回老家还是就地过节？」远比「中秋怎么过」好）；④lead/closing 有温度像聊天。\n\n"
     )
+    if theme:
+        user_prompt += (
+            f"【今日应景】今天是「{theme}」，今日一问请优先结合这个节日/节气来设计"
+            f"（须贴近中老年生活、遵守规则7方向与不涉红线）。出题角度参考："
+            f"中秋·端午·重阳等传统节日→团圆家宴与敬老；立春·立秋·冬至等节气→时令饮食与起居养生；"
+            f"国庆·元旦→休假出行与家庭聚会；清明→回乡祭祖或云祭扫。给一个具体可答的场景即可，不要硬凑。\n\n"
+        )
     if search_ctx:
         user_prompt += (
             "以下是联网检索到的白名单媒体素材（仅可据此成稿，不得引用素材之外的信息）：\n"
