@@ -195,7 +195,16 @@ function copyText(txt, msg){
     b.onclick = function(){ render(i); };
     tabs.appendChild(b);
   });
-  render(0);
+  // 支持 ?d=YYYYMMDD / ?d=YYYY-MM-DD：方糖推送链接带该参数时，确定性打开当天，避免看到过期构建
+  var idx = 0;
+  try {
+    var q = new URLSearchParams(location.search).get('d');
+    if (q) {
+      var want = q.length === 8 ? (q.slice(0,4)+'-'+q.slice(4,6)+'-'+q.slice(6,8)) : q;
+      DATA.forEach(function(d, i){ if (d.date === want) idx = i; });
+    }
+  } catch(e) {}
+  render(idx);
 })();
 </script>
 </body>
