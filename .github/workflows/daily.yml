@@ -64,13 +64,30 @@ jobs:
         id: check
         run: |
           DAY=$(python -c "from datetime import datetime,timedelta,timezone; print(datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d'))")
-          echo "day=$DAY"
+          echo "day=$DAY" >> "$GITHUB_OUTPUT"
+          # 1) main 已有产出 -> 跳过（含推送）
           if [ -f "news_wechat/output/news_${DAY}.json" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "当日 $DAY 已存在，整轮跳过（含推送）"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "当日 $DAY 已存在于 main，整轮跳过"
+            exit 0
           fi
+          # 2) 线上手机页已含当天 -> 说明此前已成功部署+推送（防 schedule 与 cron-job.org 双触发重复推送）
+          export DAY
+          python - <<'PY'
+          import urllib.request, os
+          day = os.environ["DAY"]
+          owner = "${{ github.repository_owner }}"
+          repo = "${{ github.event.repository.name }}"
+          url = f"https://raw.githubusercontent.com/{owner}/{repo}/gh-pages/index.html"
+          try:
+              h = urllib.request.urlopen(url, timeout=20).read().decode("utf-8", "replace")
+              if day in h:
+                  open("/tmp/_skip_flag", "w").write("1")
+                  print("线上手机页已含", day, "-> 将整轮跳过")
+          except Exception as e:
+              print("gh-pages 检查失败(视为未部署):", e)
+          PY
+          if [ -f /tmp/_skip_flag ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
 
       - name: 采集 + 成稿（大模型联网搜索）
         if: ${{ steps.check.outputs.skip != 'true' }}
@@ -80,11 +97,11 @@ jobs:
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           SEARCH_MODE: ${{ secrets.SEARCH_MODE }}
-        run: python news_wechat/collect.py
+        run: python news_wechat/collect.py "${{ steps.check.outputs.day }}"
 
       - name: 渲染 + 合规审核（BLOCK 会中断）
         if: ${{ steps.check.outputs.skip != 'true' }}
-        run: python news_wechat/render.py
+        run: python news_wechat/render.py "${{ steps.check.outputs.day }}"
 
       - name: 注入公众号凭据并群发（可选，未配置则跳过）
         if: ${{ steps.check.outputs.skip != 'true' }}
@@ -126,25 +143,28 @@ jobs:
         env:
           PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
           SCKEY: ${{ secrets.SCKEY }}
-        run: python news_wechat/push_sc.py "$PAGE_URL"
+        run: python news_wechat/push_sc.py "$PAGE_URL" "${{ steps.check.outputs.day }}"
 
       - name: 提交产出（供跨期查重与历史归档）
         if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$(pwd)"
+          git config pull.rebase true
           git add news_wechat/output news_wechat/mobile_dist
           if git diff --cached --quiet; then
             echo "无产出变更，跳过提交"
             exit 0
           fi
           git commit -m "chore: 自动产出 $(date +%F)"
-          for i in 1 2 3; do
-            git pull --rebase origin main || true
-            if git push origin main; then
+          for i in $(seq 1 6); do
+            git fetch origin main
+            if git rebase origin/main && git push origin main; then
               echo "提交产出成功"; exit 0
             fi
-            sleep 5
+            git rebase --abort 2>/dev/null || true
+            echo "第 $i 次提交失败，重试..."; sleep 10
           done
           echo "::error::提交产出失败（main 可能有并发提交，请手动同步 output）"; exit 1
 
@@ -154,15 +174,18 @@ jobs:
           if [ -f news_wechat/output/_collect_error.txt ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config --global --add safe.directory "$(pwd)"
+            git config pull.rebase true
             git add news_wechat/output/_collect_error.txt
             if git diff --cached --quiet; then
               echo "诊断文件无变更，跳过"
             else
               git commit -m "debug: 采集诊断 $(date +%FT%H%M%S)" || true
-              for i in 1 2 3; do
-                git pull --rebase origin main || true
-                if git push origin main; then break; fi
-                sleep 5
+              for i in $(seq 1 6); do
+                git fetch origin main
+                if git rebase origin/main && git push origin main; then break; fi
+                git rebase --abort 2>/dev/null || true
+                sleep 10
               done
             fi
           fi
