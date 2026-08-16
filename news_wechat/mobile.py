@@ -65,26 +65,26 @@ PAGE = """<!DOCTYPE html>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;background:#f2f3f5;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;color:#1a1a1a;padding-bottom:96px}
 .bar{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid #e8e8e8;padding:10px 12px}
-.bar h1{margin:0 0 8px;font-size:15px;font-weight:500}
+.bar h1{margin:0 0 8px;font-size:17px;font-weight:500}
 .tabs{display:flex;gap:8px;overflow-x:auto;-webkit-overflow-scrolling:touch}
-.tabs button{flex:0 0 auto;border:1px solid #ddd;background:#fff;color:#555;border-radius:16px;padding:5px 14px;font-size:13px}
+.tabs button{flex:0 0 auto;border:1px solid #ddd;background:#fff;color:#555;border-radius:16px;padding:5px 14px;font-size:15px}
 .tabs button.on{background:#07c160;border-color:#07c160;color:#fff}
-.tip{margin:12px 12px 0;background:#fff;border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.7;color:#555}
+.tip{margin:12px 12px 0;background:#fff;border-radius:10px;padding:12px 14px;font-size:15px;line-height:1.9;color:#555}
 .tip b{font-weight:500;color:#1a1a1a}
 .tip ol{margin:8px 0 0;padding-left:20px}
 .meta{margin:12px 12px 0;background:#fff;border-radius:10px;padding:12px 14px}
-.meta .lbl{font-size:12px;color:#999;margin-bottom:4px}
-.meta .val{font-size:14px;line-height:1.6;word-break:break-all}
+.meta .lbl{font-size:14px;color:#999;margin-bottom:4px}
+.meta .val{font-size:16px;line-height:1.8;word-break:break-all}
 .meta .row{margin-bottom:12px}
 .meta .row:last-child{margin-bottom:0}
-.copy-s{border:1px solid #07c160;background:#fff;color:#07c160;border-radius:6px;padding:4px 12px;font-size:12px;margin-top:6px}
+.copy-s{border:1px solid #07c160;background:#fff;color:#07c160;border-radius:6px;padding:4px 12px;font-size:14px;margin-top:6px}
 .paper{margin:12px 12px 0;background:#fff;border-radius:10px;padding:14px 6px;overflow:hidden}
 .dock{position:absolute;left:0;right:0;bottom:0;height:0}
 .actions{position:fixed;left:0;right:0;bottom:0;z-index:30;background:#fff;border-top:1px solid #e8e8e8;padding:10px 12px calc(10px + env(safe-area-inset-bottom));display:flex;gap:10px}
-.actions button{flex:1;border:0;border-radius:8px;padding:13px 0;font-size:15px;font-weight:500}
+.actions button{flex:1;border:0;border-radius:8px;padding:13px 0;font-size:17px;font-weight:500}
 #btnRich{background:#07c160;color:#fff}
 #btnCode{background:#f2f3f5;color:#444}
-.toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.82);color:#fff;padding:12px 20px;border-radius:8px;font-size:14px;z-index:99;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80%;text-align:center;line-height:1.5}
+.toast{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.82);color:#fff;padding:12px 20px;border-radius:8px;font-size:16px;z-index:99;opacity:0;transition:opacity .2s;pointer-events:none;max-width:80%;text-align:center;line-height:1.5}
 .toast.on{opacity:1}
 textarea{position:fixed;left:-9999px;top:0}
 </style>

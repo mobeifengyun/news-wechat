@@ -18,7 +18,7 @@ import os
 import socket
 import subprocess
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 OUTPUT = os.path.join(BASE, "output")
@@ -118,6 +118,39 @@ def clear_todo():
         os.remove(TODO)
 
 
+# 记录已告警过的漏跑日期，避免每次开机/登录都重复推送、浪费方糖额度。
+STATE = os.path.join(BASE, "output", "_catchup_state.json")
+
+
+def load_state():
+    try:
+        return json.load(open(STATE, encoding="utf-8"))
+    except Exception:
+        return {"alerted": [], "ts": ""}
+
+
+def save_state(alerted):
+    os.makedirs(OUTPUT, exist_ok=True)
+    json.dump(
+        {"alerted": sorted(set(alerted)), "ts": datetime.now().isoformat(timespec="seconds")},
+        open(STATE, "w", encoding="utf-8"), ensure_ascii=False, indent=2,
+    )
+
+
+def due_days(miss):
+    """只把『已过云端计划运行时间(北京 07:00)』的日期视为真正的漏跑候选。
+
+    当天 07:00 之前云端尚未触发，不算漏跑，避免一早重启误报。
+    """
+    now_bj = datetime.now(timezone(timedelta(hours=8)))
+    out = []
+    for ds in miss:
+        d = date.fromisoformat(ds)
+        if d < now_bj.date() or (d == now_bj.date() and now_bj.hour >= 7):
+            out.append(ds)
+    return out
+
+
 def push(cfg, title, desp):
     key = (cfg.get("wechat") or {}).get("sckey", "")
     if not key or str(key).startswith("请填入"):
@@ -166,6 +199,7 @@ def main():
     if not miss_json and not miss_html:
         log("无缺口，一切正常")
         clear_todo()
+        save_state([])  # 清零已告警记忆，下次真漏跑会重新提醒
         return 0
 
     if args.check:
@@ -181,10 +215,18 @@ def main():
 
     pending = write_todo(miss_json, failed)
 
-    if miss_json and online and not args.no_push:
+    # 只有『已到计划运行时间』且『此前未告警过』的漏跑才推送，避免每次开机重复扣方糖次数
+    due = due_days(miss_json)
+    prev = set(load_state().get("alerted", []))
+    new = [d for d in due if d not in prev]
+    if due:
+        save_state(due)  # 标记这些日期已处理，后续开机不再重复推送
+    if new and online and not args.no_push:
         lines = [
             f"**检测时间**：{pending['updated_at']}",
-            f"**缺期**：{len(miss_json)} 天 —— " + "、".join(miss_json),
+            f"**新增漏跑**：{len(new)} 天 —— " + "、".join(new),
+            f"**此前已提醒(本次不再重复推送)**："
+            + ("、".join(sorted(due - set(new))) or "无"),
             "",
             "这些日期需要重新联网采集成稿，脚本补不了。",
             "打开 WorkBuddy 说一句「补跑 news_wechat 缺失期次」即可。",
@@ -192,6 +234,12 @@ def main():
         if fixed:
             lines.append(f"\n（另有 {len(fixed)} 天已自动重渲染修复）")
         push(load_cfg(), "报简说 · 检测到漏跑", "\n\n".join(lines))
+    elif new:
+        log(f"有新增漏跑 {len(new)} 天（{', '.join(new)}），但本次因 --no-push 或离线未推送")
+    elif due:
+        log(f"漏跑日期 {len(due)} 天均已在既往开机时告警过，本次静默跳过，不重复推送")
+    else:
+        log("缺失日期均未到云端计划运行时间(北京07:00)，暂不视为漏跑")
 
     return 1
 

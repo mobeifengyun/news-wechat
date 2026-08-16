@@ -65,12 +65,12 @@ def render(data, cfg):
         '<section style="margin:0 8px;font-family:-apple-system,BlinkMacSystemFont,'
         '\'Helvetica Neue\',\'PingFang SC\',sans-serif;">'
         f'<section style="text-align:center;padding:18px 0 6px;">'
-        f'<p style="font-size:21px;font-weight:bold;color:#222;margin:0;letter-spacing:1px;">'
+        f'<p style="font-size:24px;font-weight:bold;color:#222;margin:0;letter-spacing:1px;">'
         f'<span style="color:#C0392B;">{brand}</span>'
         f'<span style="color:#ccc;font-weight:normal;padding:0 6px;">|</span>'
         f'每日消息早知道</p>'
-        f'<p style="font-size:13px;color:#888;margin:8px 0 0;">{date_cn}</p>'
-        f'<p style="font-size:13px;color:#888;margin:6px 0 0;">{greeting}</p>'
+        f'<p style="font-size:15px;color:#888;margin:8px 0 0;">{date_cn}</p>'
+        f'<p style="font-size:15px;color:#888;margin:6px 0 0;">{greeting}</p>'
         '</section>'
         '<section style="height:1px;background:#e5e5e5;margin:14px 0 4px;"></section>'
     )
@@ -79,16 +79,16 @@ def render(data, cfg):
         parts.append(
             '<section style="margin-top:22px;">'
             f'<section style="display:inline-block;background:{color};color:#fff;'
-            'font-size:15px;font-weight:bold;padding:5px 14px;border-radius:4px;">'
+            'font-size:18px;font-weight:bold;padding:5px 14px;border-radius:4px;">'
             f'{sec["name"]}</section>'
         )
         for i, it in enumerate(sec.get("items", []), 1):
             src = it.get("source", "")
             src_html = (
-                f'<span style="color:#999;font-size:12px;">（{src}）</span>' if src else ""
+                f'<span style="color:#999;font-size:14px;">（{src}）</span>' if src else ""
             )
             parts.append(
-                f'<p style="font-size:15px;color:#333;line-height:1.75;margin:12px 4px 0;">'
+                f'<p style="font-size:18px;color:#333;line-height:1.9;margin:12px 4px 0;">'
                 f'<span style="color:{color};font-weight:bold;">{i}. </span>'
                 f'{it["text"]}{src_html}</p>'
             )
@@ -100,16 +100,16 @@ def render(data, cfg):
         parts.append(
             '<section style="margin-top:22px;">'
             f'<section style="display:inline-block;background:{hcolor};color:#fff;'
-            'font-size:15px;font-weight:bold;padding:5px 14px;border-radius:4px;">'
+            'font-size:18px;font-weight:bold;padding:5px 14px;border-radius:4px;">'
             f'{hot.get("name", "热点榜单")}</section>'
         )
         for i, it in enumerate(hot_items, 1):
             site = it.get("site", "")
             site_html = (
-                f'<span style="color:#999;font-size:12px;">（{site}）</span>' if site else ""
+                f'<span style="color:#999;font-size:14px;">（{site}）</span>' if site else ""
             )
             parts.append(
-                f'<p style="font-size:15px;color:#333;line-height:1.75;margin:12px 4px 0;">'
+                f'<p style="font-size:18px;color:#333;line-height:1.9;margin:12px 4px 0;">'
                 f'<span style="color:{hcolor};font-weight:bold;">{i}. </span>'
                 f'{it["text"]}{site_html}</p>'
             )
@@ -119,14 +119,14 @@ def render(data, cfg):
         parts.append(
             '<section style="margin-top:26px;background:#f7f7f7;border-radius:8px;'
             'padding:16px 18px;">'
-            '<p style="font-size:14px;color:#555;line-height:1.8;margin:0;text-align:center;">'
+            '<p style="font-size:16px;color:#555;line-height:2.0;margin:0;text-align:center;">'
             f'<span style="font-weight:bold;color:#333;">【每日微语】</span>{quote}</p>'
             "</section>"
         )
     parts.append(render_interaction(data))
     parts.append(
         '<section style="margin-top:28px;padding-top:12px;border-top:1px solid #e5e5e5;">'
-        '<p style="font-size:12px;color:#aaa;text-align:center;line-height:1.8;margin:0;">'
+        '<p style="font-size:14px;color:#aaa;text-align:center;line-height:2.0;margin:0;">'
         f'{brand} · 每日消息早知道<br>'
         '内容综合自新华社、人民日报、央视新闻等权威媒体公开报道<br>仅作信息分享，不构成任何建议'
         "</p></section></section>"
@@ -153,21 +153,21 @@ def _card_open(kind):
         '<section style="background:#fff;border-radius:8px;padding:13px 14px 14px;'
         'margin-bottom:10px;">'
         f'<p style="margin:0 0 8px;"><span style="display:inline-block;background:{color};'
-        'color:#fff;font-size:11px;font-weight:bold;letter-spacing:1px;'
+        'color:#fff;font-size:13px;font-weight:bold;letter-spacing:1px;'
         f'border-radius:3px;padding:2px 7px;">{label}</span></p>'
     )
 
 
 def _topic(text):
     return (
-        '<p style="font-size:14px;color:#333;line-height:1.75;margin:0;'
+        '<p style="font-size:16px;color:#333;line-height:1.9;margin:0;'
         f'font-weight:bold;">{text}</p>'
     )
 
 
 def _hint(text):
     return (
-        '<p style="font-size:12px;color:#999;line-height:1.7;margin:8px 0 0;">'
+        '<p style="font-size:14px;color:#999;line-height:1.9;margin:8px 0 0;">'
         f'{text}</p>'
     )
 
@@ -190,7 +190,7 @@ def render_card(c):
         if c.get("answer"):
             p.append(
                 _blank_box(
-                    '<p style="font-size:14px;color:#333;line-height:1.75;margin:0;">'
+                    '<p style="font-size:16px;color:#333;line-height:1.9;margin:0;">'
                     f'{c["answer"]}</p>'
                 )
             )
@@ -202,7 +202,7 @@ def render_card(c):
         unit = c.get("unit", "")
         p.append(
             _blank_box(
-                '<p style="font-size:15px;color:#333;line-height:1.9;margin:0;'
+                '<p style="font-size:18px;color:#333;line-height:1.9;margin:0;'
                 'text-align:center;letter-spacing:1px;">'
                 '我猜 <span style="color:#E67E22;font-weight:bold;">＿＿＿＿</span>'
                 f' {unit}</p>'
@@ -214,7 +214,7 @@ def render_card(c):
         p.append(_topic(c.get("topic", "")))
         p.append(
             _blank_box(
-                '<p style="font-size:13px;color:#666;line-height:1.9;margin:0;">'
+                '<p style="font-size:15px;color:#666;line-height:1.9;margin:0;">'
                 f'格式：<span style="color:#333;font-weight:bold;">{c.get("format", "")}</span>'
                 "<br>"
                 f'示例：<span style="color:{GREEN};">{c.get("example", "")}</span></p>'
@@ -227,12 +227,12 @@ def render_card(c):
         left, right = c.get("left", ""), c.get("right", "")
         p.append(
             _blank_box(
-                '<p style="font-size:13px;color:#666;line-height:1.9;margin:0;'
+                '<p style="font-size:15px;color:#666;line-height:1.9;margin:0;'
                 'text-align:center;">'
                 '在评论区打这两个字<br>'
-                f'<span style="font-size:16px;color:#2E86C1;font-weight:bold;">「{left}」</span>'
-                '<span style="font-size:13px;color:#bbb;">　或　</span>'
-                f'<span style="font-size:16px;color:#C0392B;font-weight:bold;">「{right}」</span>'
+                f'<span style="font-size:18px;color:#2E86C1;font-weight:bold;">「{left}」</span>'
+                '<span style="font-size:15px;color:#bbb;">　或　</span>'
+                f'<span style="font-size:18px;color:#C0392B;font-weight:bold;">「{right}」</span>'
                 "</p>"
             )
         )
@@ -242,7 +242,7 @@ def render_card(c):
         p.append(_topic(c.get("topic", "")))
         p.append(
             _blank_box(
-                '<p style="font-size:15px;color:#333;line-height:1.9;margin:0;'
+                '<p style="font-size:18px;color:#333;line-height:1.9;margin:0;'
                 f'text-align:center;">{c.get("template", "")}</p>'
             )
         )
@@ -267,18 +267,18 @@ def render_interaction(data):
     p = ['<section style="margin-top:26px;border:1px solid #d9f0e2;border-radius:10px;'
          'background:#f4fbf7;padding:16px 14px 18px;">']
     p.append(
-        f'<p style="font-size:16px;font-weight:bold;color:{GREEN};margin:0 0 4px;">'
+        f'<p style="font-size:18px;font-weight:bold;color:{GREEN};margin:0 0 4px;">'
         f'{inter.get("title", "今日一问")}</p>'
     )
     if inter.get("lead"):
         p.append(
-            f'<p style="font-size:13px;color:#666;line-height:1.7;margin:0 0 12px;">'
+            f'<p style="font-size:15px;color:#666;line-height:1.9;margin:0 0 12px;">'
             f'{inter["lead"]}</p>'
         )
     p.append(render_card(card))
     closing = inter.get("closing", "评论区打一行字就行，明天这一栏公布结果。")
     p.append(
-        f'<p style="font-size:13px;color:#666;line-height:1.7;margin:10px 0 0;'
+        f'<p style="font-size:15px;color:#666;line-height:1.9;margin:10px 0 0;'
         f'text-align:center;">{closing}</p>'
     )
     p.append("</section>")
