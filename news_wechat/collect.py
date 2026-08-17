@@ -429,6 +429,32 @@ def audit_block(data, day):
         return 0
 
 
+# ---------------- 时效性 / 真实性兜底校验 ----------------
+import re as _re
+
+def check_freshness(data, day):
+    """扫描生成文本，命中明显旧闻/编造信号则判错，强制重生成，杜绝失真新闻。"""
+    from datetime import date as _date
+    yr = _date.fromisoformat(day).year
+    errors = []
+    # 往年年份（早 2 年及以上）硬错：如 2026 年写成 2024 年
+    for s in data.get("sections", []):
+        for i, it in enumerate(s.get("items", []), 1):
+            t = it.get("text", "")
+            for ystr in _re.findall(r"(?:19|20)\d{2}", t):
+                y = int(ystr)
+                if y != yr and y <= yr - 2:
+                    errors.append(f"[{s['name']}] 第{i}条出现往年年份 {ystr}（今年 {yr}）：{t[:18]}…")
+                    break
+            # 旧闻 / 未发生信号（防"杭州亚运会倒计时""即将开幕"等硬错）
+            for mk in ("倒计时", "即将开幕", "即将举行", "即将召开", "即将开赛",
+                       "即将上映", "即将开播", "定于近日", "拟于本月", "计划于下月"):
+                if mk in t:
+                    errors.append(f"[{s['name']}] 第{i}条含旧闻/未发生信号「{mk}」：{t[:18]}…")
+                    break
+    return errors
+
+
 def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     d = date.fromisoformat(day)
     theme = festival_of(d)
@@ -622,6 +648,20 @@ def main():
     if not use_tavily and not use_kimi and "googleapis.com" in base_url and search_mode != "none":
         tools = [{"googleSearch": {}}]
 
+    # 空检索硬熔断：没有任何真实检索手段时，绝不允许大模型凭知识编造新闻
+    if not search_ctx and not tools:
+        msg = (
+            "ERROR: 未配置任何真实联网检索（TAVILY_API_KEY 未设且非 Kimi/Google 搜索模式），"
+            "为避免编造虚假新闻，已拒绝生成。请在 GitHub Secrets 配置 TAVILY_API_KEY 并将 SEARCH_MODE 设为 tavily。"
+        )
+        print(msg)
+        try:
+            with open("news_wechat/output/_collect_error.txt", "w", encoding="utf-8") as f:
+                f.write(msg + f"\ndate={day}\n")
+        except Exception:
+            pass
+        sys.exit(1)
+
     errors = []
     data = None
     last_err = ""
@@ -649,6 +689,10 @@ def main():
         errors = validate(cand, cfg)
         if errors:
             print("  校验未过：", errors[0])
+            continue
+        fresh = check_freshness(cand, day)
+        if fresh:
+            print("  时效性校验未过：", fresh[0])
             continue
         if audit_block(cand, day) > 0:
             errors = ["内容触发合规 BLOCK，请改用更中性的表述后重试"]
