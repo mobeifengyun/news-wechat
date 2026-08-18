@@ -262,8 +262,13 @@ def tavily_search(query, api_key, max_results=5, days=2):
     res = r.json().get("results", [])
     out = []
     for it in res:
-        # 优先用 raw_content（网页正文），没有则回退 content（摘要）
-        body = (it.get("raw_content") or it.get("content") or "").strip()
+        # content（摘要）通常比 raw_content（全文）干净，优先放在前面供清洗/模型使用
+        content = (it.get("content") or "").strip()
+        raw = (it.get("raw_content") or "").strip()
+        body = content
+        if raw and raw != content:
+            body += "\n" + raw
+        body = body.strip()
         # 太长则截断，避免上下文爆炸
         if len(body) > 2500:
             body = body[:2500]
@@ -478,31 +483,75 @@ def domain_to_source(url):
     return "新华社"
 
 
-def _clean_first_sentence(text):
-    """从网页正文中提取第一句完整、可用的陈述句，去掉导航/广告垃圾。"""
+# 保底降级时优先采用的核心权威媒体域名（避免低质量商业站返回导航垃圾）
+CORE_MEDIA_DOMAINS = [
+    "news.cn", "xinhuanet.com",            # 新华社
+    "cctv.com", "cntv.cn",                 # 央视新闻
+    "people.com.cn",                       # 人民日报
+    "chinanews.com.cn",                    # 中国新闻网
+    "stdaily.com",                         # 科技日报
+    "globaltimes.cn",                      # 环球时报
+    "cyol.com",                            # 中国青年报
+    "ce.cn",                               # 经济日报
+    "gmw.cn",                              # 光明日报
+    "stcn.com",                            # 证券时报
+    "thepaper.cn",                         # 澎湃新闻
+]
+
+
+def is_core_media(url):
+    return any(d in url for d in CORE_MEDIA_DOMAINS) if url else False
+
+
+def _clean_text(text):
+    """清洗 Tavily raw_content：去掉 markdown、URL、HTML 标签、导航垃圾、只保留可读中文。"""
     import re as _re
     if not text:
         return ""
-    # 先砍掉常见导航/栏目标签/站点尾部
+    # 1. 去掉 markdown 图片 ![...](...) / !(...) / 不完整的 ![...
+    text = _re.sub(r"!?\[.*?\]\(.*?\)", "", text, flags=_re.S)
+    text = _re.sub(r"!\(.*?\)", "", text, flags=_re.S)
+    text = _re.sub(r"!\[.*", "", text, flags=_re.S)
+    # 2. 去掉 markdown 链接 [...](...)，保留链接文字
+    text = _re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text, flags=_re.S)
+    # 3. 去掉所有 URL：http/https/ftp/mailto/javascript/相对路径
+    text = _re.sub(r"https?://\S+|ftps?://\S+|mailto:\S+|javascript:\S+|/\S+?\.(?:png|jpg|jpeg|gif|svg|webp|ico|css|js)\S*", "", text, flags=_re.I)
+    # 4. 去掉 HTML 标签
+    text = _re.sub(r"<[^>]+>", "", text, flags=_re.S)
+    # 5. 去掉常见站点导航/版权/编辑/来源尾巴（行级）
     junk = [
         r"订阅.*?首页", r"移动\s*English", r"首页\s*时政", r"学习时代\s*两岸频道",
-        r"滚动新闻\s*更多", r"版权声明.*?转载", r"本文来源[:：]", r"编辑[:：].*?$",
-        r"\[\].*?\]", r"\(\s*\)", r"\|.*?(网|报|刊)$",
+        r"滚动新闻\s*更多", r"版权声明.*?转载", r"本文来源[:：].*", r"编辑[:：].*",
+        r"记者[:：].*", r"免责声明.*", r"相关新闻.*", r"图集.*", r"查看大图.*",
+        r"\[\].*?\]", r"\(\s*\)", r"\|.*?(网|报|刊|社)$",
     ]
     for p in junk:
         text = _re.sub(p, "", text, flags=_re.S)
-    # 按句切分，取第一个长度合适的完整句（保留句末标点）；换行仅作为最后回退
-    for sep in ["。", "！", "？", "\n"]:
+    # 6. 去掉独立无意义片段（纯英文单词、纯数字、特殊符号串、邮箱）
+    text = _re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "", text)
+    text = _re.sub(r"\b[A-Za-z]{1,20}\b", "", text)   # 英文单词
+    text = _re.sub(r"\b\d{1,20}\b", "", text)          # 纯数字
+    # 7. 归一化空白
+    text = _re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _clean_first_sentence(text):
+    """从网页正文中提取第一句完整、可用的陈述句。"""
+    import re as _re
+    text = _clean_text(text)
+    if not text:
+        return ""
+    # 按句切分，取第一个长度合适的完整句
+    for sep in ["。」" , "。", "！", "？", "\n"]:
         parts = text.split(sep)
         for p in parts:
             p = p.strip()
-            if 15 <= len(p) <= 120 and not _re.match(r"^(记者|编辑|来源|免责声明|相关新闻)", p):
+            if 15 <= len(p) <= 120 and not _re.match(r"^(记者|编辑|来源|免责声明|相关新闻|订阅|首页|滚动新闻)", p):
                 if sep in "。！？":
                     p += sep
                 return p
-    # 实在不行返回去首尾空格后的前 80 字
-    t = text.strip()
-    return t[:80]
+    return text[:80]
 
 
 def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
@@ -521,15 +570,27 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
     }
     # 极限词过滤：兜底拼装避免触发审核 WARN
     absolute_words = ["独家", "首家", "第一", "唯一", "绝对", "百分百", "必将", "注定"]
+    # 先统一解析候选，并标记是否核心权威媒体，优先用核心媒体结果
+    def _parse_candidate(c):
+        m = _re.match(r"【(.*?)】(.*?)(?:\n来源:\s*(\S+))?$", c, _re.S)
+        if m:
+            title = m.group(1).strip()
+            content = m.group(2).strip()
+            url = m.group(3).strip() if m.group(3) else ""
+        else:
+            title = ""
+            content = c
+            url = ""
+        return title, content, url, is_core_media(url)
+
     for s in cfg["sections"]:
+        candidates = [_parse_candidate(c) for c in sec_ctx_map.get(s["name"], [])]
+        # 核心媒体优先；同质量按原顺序
+        candidates.sort(key=lambda x: (not x[3], 0))
         items = []
-        for c in sec_ctx_map.get(s["name"], []):
+        for title, content, url, _ in candidates:
             if len(items) >= s["max"]:
                 break
-            m = _re.match(r"【(.*?)】(.*?)(?:\n来源:\s*(\S+))?$", c, _re.S)
-            title = (m.group(1).strip() if m else "")
-            content = (m.group(2).strip() if m else c)
-            url = (m.group(3).strip() if m else "")
             src = domain_to_source(url) if url else "新华社"
             # 优先用正文；正文为空/太短时回退标题
             body = _clean_first_sentence(content)
@@ -540,8 +601,11 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             for w in absolute_words:
                 text = text.replace(w, "")
             text = _re.sub(r"\s+", " ", text).strip()
-            # 跳过明显是导航/标题栏/日期索引的垃圾
-            if len(text) < 12 or _re.search(r"^(第\d+页|要闻|首页|订阅|导航|202\d年\d+月\d+日.*?(热点|早报|晚报|午报|行情|市场))", text):
+            # 跳过导航/标题栏/日期索引/残留 URL/纯英文/无实质中文的垃圾
+            cn_chars = len(_re.findall(r"[\u4e00-\u9fa5]", text))
+            if (len(text) < 12 or cn_chars < 8 or
+                _re.search(r"https?|mailto|javascript|!\[|\[\]|/\w+\.\w{2,4}", text) or
+                _re.search(r"^(第\d+页|要闻|首页|订阅|导航|202\d年\d+月\d+日.*?(热点|早报|晚报|午报|行情|市场))", text)):
                 continue
             # 字数控制 28–60
             if len(text) > 58:
@@ -555,19 +619,25 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
                 items.append({"text": text, "source": src})
         if items:
             data["sections"].append({"name": s["name"], "items": items})
-    for c in hot_ctx[:12]:
-        m = _re.match(r"【(.*?)】", c)
-        t = (m.group(1).strip() if m else c.strip())[:30]
-        # 热点最好也带一句实质性内容，不要纯标题
-        if t and len(t) >= 6:
-            data["hotspot"]["items"].append({"text": t, "site": hs0})
-    # 若热搜检索结果不足 6 条，用各板块首条新闻标题兜底，保证版面完整
+
+    # 热点：解析、核心媒体优先、清洗
+    hot_candidates = [_parse_candidate(c) for c in hot_ctx]
+    hot_candidates.sort(key=lambda x: (not x[3], 0))
+    for title, content, url, _ in hot_candidates[:12]:
+        # 热榜优先用完整正文第一句，比纯标题信息量大
+        t = _clean_first_sentence(content) or _clean_text(title)
+        t = t.strip()
+        # 热点要实质性中文句子；过滤 URL/markdown/图片/无意义片段
+        cn_chars = len(_re.findall(r"[\u4e00-\u9fa5]", t))
+        if t and len(t) >= 8 and cn_chars >= 5 and not _re.search(r"https?|mailto|javascript|!\[|\[\]|/\w+\.\w{2,4}", t):
+            data["hotspot"]["items"].append({"text": t[:30], "site": hs0})
+    # 若热搜检索结果不足 6 条，用各板块首条新闻兜底，保证版面完整且字数合规
     if len(data["hotspot"]["items"]) < 6:
         pad = []
         for sec in data["sections"]:
             for it in sec.get("items", []):
-                txt = it["text"].split("。")[0][:28]
-                if txt and txt not in [x["text"] for x in data["hotspot"]["items"]]:
+                txt = it["text"][:58]
+                if 20 <= len(txt) <= 60 and txt not in [x["text"] for x in data["hotspot"]["items"]]:
                     pad.append({"text": txt, "site": hs0})
         for p in pad:
             if len(data["hotspot"]["items"]) >= 12:
@@ -787,7 +857,7 @@ def main():
             w = sec_query_words.get(s["name"], s["name"])
             queries.append(f"{_dc} {s['name']} {w}")
             sec_order.append(s["name"])
-        queries.append(f"{_dc} 热搜 微博 抖音 百度 头条 知乎")
+        queries.append(f"{_dc} 今日热点 要闻 新华社 央视")
         sec_ctx_map = {name: [] for name in sec_order}
         hot_ctx = []
         for idx, q in enumerate(queries, 1):
