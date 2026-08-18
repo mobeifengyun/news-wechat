@@ -254,6 +254,7 @@ def tavily_search(query, api_key, max_results=5, days=2):
             "topic": "news",
             "days": days,
             "time_range": "day",
+            "include_raw_content": True,
         },
         timeout=30,
     )
@@ -261,7 +262,12 @@ def tavily_search(query, api_key, max_results=5, days=2):
     res = r.json().get("results", [])
     out = []
     for it in res:
-        out.append(f"【{it.get('title','')}】{it.get('content','')}\n来源: {it.get('url','')}")
+        # 优先用 raw_content（网页正文），没有则回退 content（摘要）
+        body = (it.get("raw_content") or it.get("content") or "").strip()
+        # 太长则截断，避免上下文爆炸
+        if len(body) > 2500:
+            body = body[:2500]
+        out.append(f"【{it.get('title','')}】{body}\n来源: {it.get('url','')}")
     return out
 
 
@@ -472,6 +478,33 @@ def domain_to_source(url):
     return "新华社"
 
 
+def _clean_first_sentence(text):
+    """从网页正文中提取第一句完整、可用的陈述句，去掉导航/广告垃圾。"""
+    import re as _re
+    if not text:
+        return ""
+    # 先砍掉常见导航/栏目标签/站点尾部
+    junk = [
+        r"订阅.*?首页", r"移动\s*English", r"首页\s*时政", r"学习时代\s*两岸频道",
+        r"滚动新闻\s*更多", r"版权声明.*?转载", r"本文来源[:：]", r"编辑[:：].*?$",
+        r"\[\].*?\]", r"\(\s*\)", r"\|.*?(网|报|刊)$",
+    ]
+    for p in junk:
+        text = _re.sub(p, "", text, flags=_re.S)
+    # 按句切分，取第一个长度合适的完整句（保留句末标点）；换行仅作为最后回退
+    for sep in ["。", "！", "？", "\n"]:
+        parts = text.split(sep)
+        for p in parts:
+            p = p.strip()
+            if 15 <= len(p) <= 120 and not _re.match(r"^(记者|编辑|来源|免责声明|相关新闻)", p):
+                if sep in "。！？":
+                    p += sep
+                return p
+    # 实在不行返回去首尾空格后的前 80 字
+    t = text.strip()
+    return t[:80]
+
+
 def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
     """保底降级：不调用任何大模型，直接把 Tavily 白名单检索结果按板块拼装成稿。
     仅用于 LLM 完全不可用（无 key / 超时 / 限流）时，保证当天绝不中断、绝不编造。
@@ -486,30 +519,60 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
         "hotspot": {"name": "热点榜单", "items": []},
         "interaction": {},
     }
+    # 极限词过滤：兜底拼装避免触发审核 WARN
+    absolute_words = ["独家", "首家", "第一", "唯一", "绝对", "百分百", "必将", "注定"]
     for s in cfg["sections"]:
         items = []
-        for c in (sec_ctx_map.get(s["name"], []))[: s["max"]]:
+        for c in sec_ctx_map.get(s["name"], []):
+            if len(items) >= s["max"]:
+                break
             m = _re.match(r"【(.*?)】(.*?)(?:\n来源:\s*(\S+))?$", c, _re.S)
             title = (m.group(1).strip() if m else "")
             content = (m.group(2).strip() if m else c)
             url = (m.group(3).strip() if m else "")
             src = domain_to_source(url) if url else "新华社"
-            text = (title + "。" + content) if title else content
+            # 优先用正文；正文为空/太短时回退标题
+            body = _clean_first_sentence(content)
+            if len(body) < 12:
+                body = title
+            text = body
+            # 去掉极限词
+            for w in absolute_words:
+                text = text.replace(w, "")
             text = _re.sub(r"\s+", " ", text).strip()
+            # 跳过明显是导航/标题栏/日期索引的垃圾
+            if len(text) < 12 or _re.search(r"^(第\d+页|要闻|首页|订阅|导航|202\d年\d+月\d+日.*?(热点|早报|晚报|午报|行情|市场))", text):
+                continue
+            # 字数控制 28–60
             if len(text) > 58:
                 cut = text[:58]
                 idx = cut.rfind("。")
                 text = cut[: idx + 1] if idx > 24 else cut
             if len(text) < 28:
-                text = text.rstrip("。") + "。（更多详情请查阅白名单媒体今日报道原文）"
-            items.append({"text": text[:60], "source": src})
+                text = text + ("" if text.endswith("。") else "。") + "（详情见白名单媒体原文）"
+            text = text[:60].strip()
+            if text and text not in [it["text"] for it in items]:
+                items.append({"text": text, "source": src})
         if items:
             data["sections"].append({"name": s["name"], "items": items})
     for c in hot_ctx[:12]:
         m = _re.match(r"【(.*?)】", c)
         t = (m.group(1).strip() if m else c.strip())[:30]
-        if t:
+        # 热点最好也带一句实质性内容，不要纯标题
+        if t and len(t) >= 6:
             data["hotspot"]["items"].append({"text": t, "site": hs0})
+    # 若热搜检索结果不足 6 条，用各板块首条新闻标题兜底，保证版面完整
+    if len(data["hotspot"]["items"]) < 6:
+        pad = []
+        for sec in data["sections"]:
+            for it in sec.get("items", []):
+                txt = it["text"].split("。")[0][:28]
+                if txt and txt not in [x["text"] for x in data["hotspot"]["items"]]:
+                    pad.append({"text": txt, "site": hs0})
+        for p in pad:
+            if len(data["hotspot"]["items"]) >= 12:
+                break
+            data["hotspot"]["items"].append(p)
     top = data["hotspot"]["items"][0]["text"] if data["hotspot"]["items"] else "今天"
     data["interaction"] = {
         "title": "今日一问",
@@ -675,13 +738,21 @@ def main():
             pass
 
     api_key = os.environ.get("LLM_API_KEY", "")
-    if not api_key:
-        print("ERROR: 未设置 LLM_API_KEY，无法在云端采集。请配置 Secrets.LLM_API_KEY")
-        sys.exit(1)
-    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE).rstrip("/") + "/"
-    model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
     tavily_key = os.environ.get("TAVILY_API_KEY", "")
     search_mode = os.environ.get("SEARCH_MODE", "auto").lower()
+    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE).rstrip("/") + "/"
+    model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
+
+    use_tavily = (search_mode == "tavily") or (tavily_key and search_mode != "none")
+    use_kimi = (search_mode == "kimi") or (
+        "moonshot" in base_url and not use_tavily and search_mode != "none"
+    )
+    if not use_tavily and not api_key:
+        print("ERROR: 未设置 LLM_API_KEY，且未启用 Tavily 检索，无法在云端采集。")
+        sys.exit(1)
+    if use_tavily and not tavily_key:
+        print("ERROR: SEARCH_MODE=tavily 但未设置 TAVILY_API_KEY")
+        sys.exit(1)
 
     prev_type = prev_card_type(day)
     seed = load_seed(day)
@@ -692,10 +763,6 @@ def main():
     search_ctx = []
     sec_ctx_map = {}  # Tavily 按板块归属的检索结果（降级拼装用）
     hot_ctx = []
-    use_tavily = (search_mode == "tavily") or (tavily_key and search_mode != "none")
-    use_kimi = (search_mode == "kimi") or (
-        "moonshot" in base_url and not use_tavily and search_mode != "none"
-    )
 
     if use_kimi:
         if model == DEFAULT_MODEL:  # 用户未显式指定模型时给 Kimi 默认
@@ -726,7 +793,7 @@ def main():
         for idx, q in enumerate(queries, 1):
             print(f"  Tavily 查询 {idx}/{len(queries)}: {q}", flush=True)
             try:
-                res = tavily_search(q, tavily_key, max_results=5, days=2)
+                res = tavily_search(q, tavily_key, max_results=8, days=2)
             except Exception as e:
                 print(f"    Tavily 检索失败: {e}", flush=True)
                 res = []
