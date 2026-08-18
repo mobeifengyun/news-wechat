@@ -461,6 +461,73 @@ def check_freshness(data, day):
     return errors
 
 
+def domain_to_source(url):
+    """保底降级用：从 Tavily 返回的文章 url 反查白名单媒体名。"""
+    if not url:
+        return "新华社"
+    for name, doms in WL_DOMAINS.items():
+        for d in doms:
+            if d in url:
+                return name
+    return "新华社"
+
+
+def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
+    """保底降级：不调用任何大模型，直接把 Tavily 白名单检索结果按板块拼装成稿。
+    仅用于 LLM 完全不可用（无 key / 超时 / 限流）时，保证当天绝不中断、绝不编造。
+    来源真实（均来自白名单域名检索）、合规、可读；质量略机械，属可接受底线。"""
+    import re as _re
+    d = date.fromisoformat(day)
+    hs0 = cfg.get("hotlist_sites", ["微博热搜"])[0]
+    data = {
+        "greeting": "早安，新的一天",
+        "quote": "日子慢些过，才看得见光。",
+        "sections": [],
+        "hotspot": {"name": "热点榜单", "items": []},
+        "interaction": {},
+    }
+    for s in cfg["sections"]:
+        items = []
+        for c in (sec_ctx_map.get(s["name"], []))[: s["max"]]:
+            m = _re.match(r"【(.*?)】(.*?)(?:\n来源:\s*(\S+))?$", c, _re.S)
+            title = (m.group(1).strip() if m else "")
+            content = (m.group(2).strip() if m else c)
+            url = (m.group(3).strip() if m else "")
+            src = domain_to_source(url) if url else "新华社"
+            text = (title + "。" + content) if title else content
+            text = _re.sub(r"\s+", " ", text).strip()
+            if len(text) > 58:
+                cut = text[:58]
+                idx = cut.rfind("。")
+                text = cut[: idx + 1] if idx > 24 else cut
+            if len(text) < 28:
+                text = text.rstrip("。") + "。（更多详情请查阅白名单媒体今日报道原文）"
+            items.append({"text": text[:60], "source": src})
+        if items:
+            data["sections"].append({"name": s["name"], "items": items})
+    for c in hot_ctx[:12]:
+        m = _re.match(r"【(.*?)】", c)
+        t = (m.group(1).strip() if m else c.strip())[:30]
+        if t:
+            data["hotspot"]["items"].append({"text": t, "site": hs0})
+    top = data["hotspot"]["items"][0]["text"] if data["hotspot"]["items"] else "今天"
+    data["interaction"] = {
+        "title": "今日一问",
+        "lead": "来聊聊你今天的小日子",
+        "card": {
+            "type": "code",
+            "topic": f"关于「{top[:12]}」的今日打卡",
+            "format": "我今天__，感觉__",
+            "example": "我今天散步3000步，感觉挺舒服",
+            "hint": "评论区打个卡，记录平凡一天",
+        },
+        "closing": "每天进步一点点",
+    }
+    data["date"] = day
+    data["lunar"] = lunar_of(d)
+    return data
+
+
 def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     d = date.fromisoformat(day)
     theme = festival_of(d)
@@ -623,6 +690,8 @@ def main():
     print(f"采集 {day}（上期卡型={prev_type or '无'}）模型={model}")
 
     search_ctx = []
+    sec_ctx_map = {}  # Tavily 按板块归属的检索结果（降级拼装用）
+    hot_ctx = []
     use_tavily = (search_mode == "tavily") or (tavily_key and search_mode != "none")
     use_kimi = (search_mode == "kimi") or (
         "moonshot" in base_url and not use_tavily and search_mode != "none"
@@ -636,20 +705,38 @@ def main():
         print("检索模式：Tavily（限定白名单域名 + 近 2 日新闻）", flush=True)
         _d = date.fromisoformat(day)
         _dc = f"{_d.year}年{_d.month}月{_d.day}日"
-        queries = [
-            f"{_dc} 国内要闻 新华社 央视 人民日报", f"{_dc} 国际新闻 新华社 央视 环球",
-            f"{_dc} 财经动态 证券时报 第一财经 每日经济新闻", f"{_dc} 科技前沿 AI 芯片 科技日报 量子位",
-            f"{_dc} 社会民生 澎湃新闻 新京报", f"{_dc} 文体资讯 影视 体育 音乐",
-            f"{_dc} 热搜 微博 抖音 百度",
-        ]
+        # 各板块检索词（与 config.json 的 sections 顺序对应），拓宽白名单域名覆盖
+        sec_query_words = {
+            "国内要闻": "新华社 央视新闻 人民日报 央广网",
+            "国际新闻": "新华社 央视新闻 环球时报 国际",
+            "财经动态": "证券时报 第一财经 每日经济新闻 财经",
+            "科技前沿": "科技日报 量子位 IT之家 AI 芯片 新能源",
+            "社会民生": "澎湃新闻 新京报 社会 民生 教育",
+            "文体资讯": "影视 体育 音乐 文博 文旅",
+        }
+        queries = []
+        sec_order = []
+        for s in cfg["sections"]:
+            w = sec_query_words.get(s["name"], s["name"])
+            queries.append(f"{_dc} {s['name']} {w}")
+            sec_order.append(s["name"])
+        queries.append(f"{_dc} 热搜 微博 抖音 百度 头条 知乎")
+        sec_ctx_map = {name: [] for name in sec_order}
+        hot_ctx = []
         for idx, q in enumerate(queries, 1):
             print(f"  Tavily 查询 {idx}/{len(queries)}: {q}", flush=True)
             try:
-                res = tavily_search(q, tavily_key, max_results=4, days=2)
-                search_ctx += res
-                print(f"    返回 {len(res)} 条", flush=True)
+                res = tavily_search(q, tavily_key, max_results=5, days=2)
             except Exception as e:
                 print(f"    Tavily 检索失败: {e}", flush=True)
+                res = []
+            if idx <= len(sec_order):
+                sec_ctx_map[sec_order[idx - 1]] = res
+                print(f"    返回 {len(res)} 条 -> {sec_order[idx - 1]}", flush=True)
+            else:
+                hot_ctx = res
+                print(f"    返回 {len(res)} 条 -> 热点", flush=True)
+            search_ctx += res
         print(f"Tavily 总计检索到 {len(search_ctx)} 条上下文", flush=True)
     else:
         print("检索模式：Gemini 联网搜索（googleSearch grounding）", flush=True)
@@ -658,15 +745,18 @@ def main():
     if not use_tavily and not use_kimi and "googleapis.com" in base_url and search_mode != "none":
         tools = [{"googleSearch": {}}]
 
-    # 空检索硬熔断：没有任何真实检索手段时，绝不允许大模型凭知识编造新闻
-    if not search_ctx and not tools:
+    # 空检索硬熔断：既非 Tavily、也非 Kimi 内置搜索、又无 Google grounding 时，
+    # 才认定“没有任何真实检索手段”，绝不允许大模型凭知识编造新闻。
+    # 注意：Kimi/Moonshot 走模型内置 $web_search，search_ctx 本身为空、也不挂 googleSearch，
+    # 因此必须放行 use_kimi，否则会被误杀（这正是此前云端一直产出失败的直接原因之一）。
+    if not use_tavily and not use_kimi and not tools:
         msg = (
             "ERROR: 未配置任何真实联网检索（TAVILY_API_KEY 未设且非 Kimi/Google 搜索模式），"
             "为避免编造虚假新闻，已拒绝生成。请在 GitHub Secrets 配置 TAVILY_API_KEY 并将 SEARCH_MODE 设为 tavily。"
         )
         print(msg, flush=True)
         try:
-            with open("news_wechat/output/_collect_error.txt", "w", encoding="utf-8") as f:
+            with open(os.path.join(BASE, "output", "_collect_error.txt"), "w", encoding="utf-8") as f:
                 f.write(msg + f"\ndate={day}\n")
         except Exception:
             pass
@@ -676,7 +766,14 @@ def main():
     data = None
     last_err = ""
     last_raw = ""
+    # 未配置任何成稿模型（无 DeepSeek/Kimi key）→ 跳过 LLM，直接走 Tavily 规则拼装保底
+    no_llm = (not api_key or api_key.strip() == "") and not use_kimi
+    if no_llm:
+        print("未配置成稿模型 key，直接走 Tavily 规则拼装保底…", flush=True)
     for attempt in range(3):
+        if no_llm:
+            break
+
         sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
         print(f"第 {attempt+1}/3 次生成…", flush=True)
         try:
@@ -714,19 +811,27 @@ def main():
         break
 
     if not data:
-        try:
-            diag = (
-                f"date={day}\nuse_kimi={use_kimi} model={model}\n"
-                f"last_err={last_err}\nlast_raw={(last_raw or '')[:1500]}\n"
-                f"errors={errors}\n"
-            )
-            with open(err_path, "w", encoding="utf-8") as f:
-                f.write(diag)
-            print("已写诊断到", err_path, flush=True)
-        except Exception:
-            pass
-        print("ERROR: 3 次尝试仍未生成合规内容：", errors, flush=True)
-        sys.exit(1)
+        # LLM 成稿失败 → 降级为 Tavily 规则拼装（无模型依赖，保证当天出稿、绝不编造）
+        if use_tavily and sec_ctx_map:
+            print("⚠️ LLM 成稿失败，降级为 Tavily 规则拼装保底…", flush=True)
+            ruled = rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type)
+            if ruled:
+                data = ruled
+                print("✅ 规则拼装成功，已生成当日真实新闻（无大模型依赖）", flush=True)
+        if not data:
+            try:
+                diag = (
+                    f"date={day}\nuse_kimi={use_kimi} model={model}\n"
+                    f"last_err={last_err}\nlast_raw={(last_raw or '')[:1500]}\n"
+                    f"errors={errors}\n"
+                )
+                with open(err_path, "w", encoding="utf-8") as f:
+                    f.write(diag)
+                print("已写诊断到", err_path, flush=True)
+            except Exception:
+                pass
+            print("ERROR: 3 次尝试仍未生成合规内容且降级失败：", errors, flush=True)
+            sys.exit(1)
 
     # 农历由代码计算，避免模型误差
     d = date.fromisoformat(day)
