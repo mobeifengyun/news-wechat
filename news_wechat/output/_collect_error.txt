@@ -1,2 +1,5 @@
-ERROR: 未配置任何真实联网检索（TAVILY_API_KEY 未设且非 Kimi/Google 搜索模式），为避免编造虚假新闻，已拒绝生成。请在 GitHub Secrets 配置 TAVILY_API_KEY 并将 SEARCH_MODE 设为 tavily。
 date=2026-08-18
+use_kimi=False model=kimi-k2.6
+last_err=HTTPSConnectionPool(host='api.moonshot.cn', port=443): Read timed out. (read timeout=45)
+last_raw=
+errors=["模型返回无法解析为 JSON：HTTPSConnectionPool(host='api.moonshot.cn', port=443): Read timed out. (read tim"]
