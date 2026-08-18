@@ -1,5 +1,0 @@
-date=2026-08-18
-use_kimi=False model=kimi-k2.6
-last_err=HTTPSConnectionPool(host='api.moonshot.cn', port=443): Read timed out. (read timeout=45)
-last_raw=
-errors=["模型返回无法解析为 JSON：HTTPSConnectionPool(host='api.moonshot.cn', port=443): Read timed out. (read tim"]
