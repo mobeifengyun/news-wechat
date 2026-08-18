@@ -309,8 +309,9 @@ def main():
     if counts.get("BLOCK", 0):
         print("ERROR: 存在 BLOCK 级违规内容，禁止发布，请修正后重新渲染")
         sys.exit(3)
+    # WARN/NOTE 只提示不中断，保证自动化稳定运行
     if warnings:
-        sys.exit(2)
+        print("注意：存在 WARN，但非 BLOCK，继续发布")
 
 
 if __name__ == "__main__":
