@@ -262,16 +262,17 @@ def tavily_search(query, api_key, max_results=5, days=2):
     res = r.json().get("results", [])
     out = []
     for it in res:
-        # content（摘要）通常比 raw_content（全文）干净，优先放在前面供清洗/模型使用
+        # content（摘要）通常比 raw_content（全文）干净，优先使用；
+        # 仅当摘要过短（<80 字）时才补充 raw_content 前段，避免把整页导航/UI 垃圾倒进来。
         content = (it.get("content") or "").strip()
         raw = (it.get("raw_content") or "").strip()
         body = content
-        if raw and raw != content:
-            body += "\n" + raw
+        if len(body) < 80 and raw and raw != content:
+            body += "\n" + raw[:800]
         body = body.strip()
         # 太长则截断，避免上下文爆炸
-        if len(body) > 2500:
-            body = body[:2500]
+        if len(body) > 1200:
+            body = body[:1200]
         out.append(f"【{it.get('title','')}】{body}\n来源: {it.get('url','')}")
     return out
 
@@ -504,54 +505,107 @@ def is_core_media(url):
 
 
 def _clean_text(text):
-    """清洗 Tavily raw_content：去掉 markdown、URL、HTML 标签、导航垃圾、只保留可读中文。"""
+    """深度清洗 Tavily 返回的网页文本：去掉 markdown、URL、HTML、导航/UI 垃圾、
+    英文数字碎片、订阅收藏按钮等，只保留正文段落。"""
     import re as _re
     if not text:
         return ""
-    # 1. 去掉 markdown 图片 ![...](...) / !(...) / 不完整的 ![...
+
+    # 1. markdown 图片/链接：去掉图片，链接保留文字
     text = _re.sub(r"!?\[.*?\]\(.*?\)", "", text, flags=_re.S)
     text = _re.sub(r"!\(.*?\)", "", text, flags=_re.S)
-    text = _re.sub(r"!\[.*", "", text, flags=_re.S)
-    # 2. 去掉 markdown 链接 [...](...)，保留链接文字
     text = _re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text, flags=_re.S)
-    # 3. 去掉所有 URL：http/https/ftp/mailto/javascript/相对路径
-    text = _re.sub(r"https?://\S+|ftps?://\S+|mailto:\S+|javascript:\S+|/\S+?\.(?:png|jpg|jpeg|gif|svg|webp|ico|css|js)\S*", "", text, flags=_re.I)
-    # 4. 去掉 HTML 标签
-    text = _re.sub(r"<[^>]+>", "", text, flags=_re.S)
-    # 5. 去掉常见站点导航/版权/编辑/来源尾巴（行级）
-    junk = [
-        r"订阅.*?首页", r"移动\s*English", r"首页\s*时政", r"学习时代\s*两岸频道",
-        r"滚动新闻\s*更多", r"版权声明.*?转载", r"本文来源[:：].*", r"编辑[:：].*",
-        r"记者[:：].*", r"免责声明.*", r"相关新闻.*", r"图集.*", r"查看大图.*",
-        r"\[\].*?\]", r"\(\s*\)", r"\|.*?(网|报|刊|社)$",
-    ]
-    for p in junk:
-        text = _re.sub(p, "", text, flags=_re.S)
-    # 6. 去掉独立无意义片段（纯英文单词、纯数字、特殊符号串、邮箱）
+
+    # 2. URL / 邮箱 / 脚本
+    text = _re.sub(r"https?://\S+|ftps?://\S+|mailto:\S+|javascript:\S+", "", text, flags=_re.I)
     text = _re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "", text)
-    text = _re.sub(r"\b[A-Za-z]{1,20}\b", "", text)   # 英文单词
-    text = _re.sub(r"\b\d{1,20}\b", "", text)          # 纯数字
-    # 7. 归一化空白
+
+    # 3. HTML 标签
+    text = _re.sub(r"<[^>]+>", "", text, flags=_re.S)
+
+    # 4. markdown 标题、列表、代码块
+    text = _re.sub(r"^\s*#{1,6}\s+", "", text, flags=_re.M)
+    text = _re.sub(r"^\s*[\*\-\+]\s+", "", text, flags=_re.M)
+    text = _re.sub(r"^\s*>\s+", "", text, flags=_re.M)
+    text = _re.sub(r"```[\s\S]*?```", "", text)
+    text = _re.sub(r"`[^`]+`", "", text)
+    text = _re.sub(r"#{2,}", "", text)          # 残留 ####
+    text = _re.sub(r"\*{2,}", "", text)         # 残留 **
+
+    # 5. UI 控件/站点占位（截图中实际出现的脏词）
+    text = _re.sub(r"Image\s*\d+", "", text, flags=_re.I)
+    text = _re.sub(r"\d+_\s*订阅|\d+_\s*收藏", "", text, flags=_re.I)
+    text = _re.sub(r"已订阅|已收藏|订阅|收藏|分享|评论|点赞|转发", "", text)
+    text = _re.sub(r"全部导航|网站地图|回到顶部|返回首页|更多>>|更多>|相关阅读|延伸阅读|推荐阅读|热图推荐|图集|查看大图|字号|打印|复制地址|QQ空间", "", text)
+    text = _re.sub(r"\*+\s*党政\s*\*+.*", "", text, flags=_re.S)
+    text = _re.sub(r"[\|_]{2,}", "", text)      # ||、__ 分隔符
+    text = _re.sub(r"[【】]", "", text)           # 去掉 Tavily 包裹标记，避免残留
+
+    # 6. 来源/编辑/记者/时间等行
+    text = _re.sub(r"(?:来源|编辑|记者|作者|审核|校对|发布时间|更新时间|阅读|浏览量)[:：]\s*[^\n]{0,60}", "", text)
+    text = _re.sub(r"^\s*(?:来源|编辑|记者|作者|审核|校对|免责声明|版权声明|相关新闻|延伸阅读|网友评论)\s*$", "", text, flags=_re.M)
+    text = _re.sub(r"详情见.*?原文", "", text, flags=_re.S)
+    # 去掉像 "2026年08月18日17: |" 这样的日期时间前缀
+    text = _re.sub(r"20\d{2}年\d{1,2}月\d{1,2}日\s*(?:\d{1,2}[：:]\d{0,2})?\s*[\|\-]\s*", "", text)
+
+    # 7. 英文单词、孤立数字、残留符号
+    text = _re.sub(r"[A-Za-z]{1,30}", "", text)
+    text = _re.sub(r"\b\d{1,20}\b", "", text)
+    text = _re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：\"\"''“”‘’（）【】《》—～…\s]", " ", text)
+
+    # 8. 归一化空白
     text = _re.sub(r"\s+", " ", text).strip()
+
+    # 9. 段落提取：取最长、中文密度最高且不含导航词的段落
+    paragraphs = _re.split(r"\n\s*\n|\r\n\s*\r\n", text)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    nav_words = ["导航", "订阅", "收藏", "首页", "滚动", "版权声明", "免责声明", "相关新闻", "图集", "查看更多", "分享", "登录", "注册"]
+    scored = []
+    for p in paragraphs:
+        cn = len(_re.findall(r"[\u4e00-\u9fa5]", p))
+        nav = sum(p.count(w) for w in nav_words)
+        if cn >= 15 and nav * 30 < cn:
+            scored.append((cn - nav * 10, p))
+    if scored:
+        return max(scored, key=lambda x: x[0])[1]
     return text
 
 
 def _clean_first_sentence(text):
-    """从网页正文中提取第一句完整、可用的陈述句。"""
+    """从网页正文中提取第一句完整、可用的陈述句（避开导航/标题/来源行）。"""
     import re as _re
     text = _clean_text(text)
     if not text:
         return ""
-    # 按句切分，取第一个长度合适的完整句
-    for sep in ["。」" , "。", "！", "？", "\n"]:
+
+    forbidden_starts = ["记者", "编辑", "来源", "免责声明", "版权声明", "相关新闻", "订阅", "导航", "首页", "滚动新闻", "图集", "第"]
+    forbidden_inside = ["Image", "订阅", "收藏", "全部导航", "https", "mailto", "javascript", "复制地址", "QQ空间", "####", "来源", "详情见"]
+
+    for sep in ["。」", "。", "！", "？", "；"]:
         parts = text.split(sep)
         for p in parts:
             p = p.strip()
-            if 15 <= len(p) <= 120 and not _re.match(r"^(记者|编辑|来源|免责声明|相关新闻|订阅|首页|滚动新闻)", p):
-                if sep in "。！？":
-                    p += sep
+            if not p:
+                continue
+            if not (15 <= len(p) <= 120):
+                continue
+            cn = len(_re.findall(r"[\u4e00-\u9fa5]", p))
+            if cn < 10:
+                continue
+            if any(p.startswith(w) for w in forbidden_starts):
+                continue
+            if any(w in p for w in forbidden_inside):
+                continue
+            if _re.search(r"来源[:：]|编辑[:：]|记者[:：]", p):
+                continue
+            if not _re.match(r"[\u4e00-\u9fa5]", p[0]):
+                continue
+            # 避免重复追加句末标点
+            if p[-1] in "。！？；":
                 return p
-    return text[:80]
+            return p + sep if sep in "。！？；" else p + "。"
+
+    return text[:80] if len(text) >= 15 else ""
 
 
 def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
@@ -592,28 +646,39 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             if len(items) >= s["max"]:
                 break
             src = domain_to_source(url) if url else "新华社"
-            # 优先用正文；正文为空/太短时回退标题
+            # 优先用正文首句；正文没有可用句时回退到清洗后的标题
             body = _clean_first_sentence(content)
             if len(body) < 12:
-                body = title
+                body = _clean_text(title)
+                # 标题兜底只接受像完整句子的标题：≥20 字且不以媒体名开头
+                if len(body) < 20 or any(body.startswith(m) for m in WHITELIST):
+                    continue
+            if len(body) < 12:
+                continue
             text = body
             # 去掉极限词
             for w in absolute_words:
                 text = text.replace(w, "")
             text = _re.sub(r"\s+", " ", text).strip()
-            # 跳过导航/标题栏/日期索引/残留 URL/纯英文/无实质中文的垃圾
+            # 再次过滤残留垃圾
             cn_chars = len(_re.findall(r"[\u4e00-\u9fa5]", text))
-            if (len(text) < 12 or cn_chars < 8 or
-                _re.search(r"https?|mailto|javascript|!\[|\[\]|/\w+\.\w{2,4}", text) or
-                _re.search(r"^(第\d+页|要闻|首页|订阅|导航|202\d年\d+月\d+日.*?(热点|早报|晚报|午报|行情|市场))", text)):
+            if (len(text) < 12 or cn_chars < 10 or
+                _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|订阅|收藏|全部导航|复制地址|QQ空间", text, _re.I) or
+                _re.search(r"^(第\d+页|要闻|首页|订阅|导航|滚动新闻|202\d年\d+月\d+日)", text)):
                 continue
-            # 字数控制 28–60
+            # 字数控制：优先 28–60；截断时尽量不破句
             if len(text) > 58:
                 cut = text[:58]
-                idx = cut.rfind("。")
-                text = cut[: idx + 1] if idx > 24 else cut
-            if len(text) < 28:
-                text = text + ("" if text.endswith("。") else "。") + "（详情见白名单媒体原文）"
+                idx = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("；"))
+                if idx >= 24:
+                    text = cut[:idx + 1]
+                else:
+                    # 无完整句末时，尽量在分句逗号后截断，避免半截词
+                    idx = cut.rfind("，")
+                    text = cut[:idx + 1] if idx >= 32 else cut
+            # 干净但偏短的句子允许放行（不再机械追加「详情见原文」）
+            if len(text) < 15:
+                continue
             text = text[:60].strip()
             if text and text not in [it["text"] for it in items]:
                 items.append({"text": text, "source": src})
@@ -627,10 +692,22 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
         # 热榜优先用完整正文第一句，比纯标题信息量大
         t = _clean_first_sentence(content) or _clean_text(title)
         t = t.strip()
-        # 热点要实质性中文句子；过滤 URL/markdown/图片/无意义片段
+        # 热点要实质性中文句子；过滤 URL/markdown/图片/UI 垃圾/无意义片段
         cn_chars = len(_re.findall(r"[\u4e00-\u9fa5]", t))
-        if t and len(t) >= 8 and cn_chars >= 5 and not _re.search(r"https?|mailto|javascript|!\[|\[\]|/\w+\.\w{2,4}", t):
-            data["hotspot"]["items"].append({"text": t[:30], "site": hs0})
+        if not (t and len(t) >= 8 and cn_chars >= 5):
+            continue
+        if _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|订阅|收藏|全部导航|复制地址|QQ空间|####", t, _re.I):
+            continue
+        # 截断到 30 字以内，尽量不破句
+        if len(t) > 30:
+            cut = t[:30]
+            idx = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("；"))
+            if idx >= 12:
+                t = cut[:idx + 1]
+            else:
+                idx = cut.rfind("，")
+                t = cut[:idx + 1] if idx >= 16 else cut
+        data["hotspot"]["items"].append({"text": t.strip(), "site": hs0})
     # 若热搜检索结果不足 6 条，用各板块首条新闻兜底，保证版面完整且字数合规
     if len(data["hotspot"]["items"]) < 6:
         pad = []
