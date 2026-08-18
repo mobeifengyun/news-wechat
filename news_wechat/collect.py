@@ -35,6 +35,12 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 
+# GitHub Actions 等非 TTY 环境下强制行缓冲，确保 print 实时可见
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
 
@@ -283,7 +289,7 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
 
 
 # ---------------- Kimi / Moonshot 联网搜索 ----------------
-def _post_with_retry(url, headers, data, timeout=150, max_retry=5):
+def _post_with_retry(url, headers, data, timeout=45, max_retry=2):
     """带 429 限流退避的 POST。Kimi 免费档 RPM 很低，一次采集会连发多轮请求，
     必须遇到 429 就按 Retry-After 等待后重试，否则整轮失败。"""
     import requests
@@ -292,7 +298,7 @@ def _post_with_retry(url, headers, data, timeout=150, max_retry=5):
             r = requests.post(url, headers=headers, data=data, timeout=timeout)
         except requests.RequestException as e:
             if i < max_retry - 1:
-                print(f"  ⏳ 网络异常 {e}，5s 后重试 ({i+1}/{max_retry})")
+                print(f"  ⏳ 网络异常 {e}，5s 后重试 ({i+1}/{max_retry})", flush=True)
                 time.sleep(5)
                 continue
             raise
@@ -303,7 +309,7 @@ def _post_with_retry(url, headers, data, timeout=150, max_retry=5):
             except Exception:
                 pass
             wait = min(max(wait, 15), 90)
-            print(f"  ⏳ 429 限流，等 {wait}s 重试 ({i+1}/{max_retry})")
+            print(f"  ⏳ 429 限流，等 {wait}s 重试 ({i+1}/{max_retry})", flush=True)
             time.sleep(wait)
             continue
         return r
@@ -613,7 +619,7 @@ def main():
     prev_type = prev_card_type(day)
     seed = load_seed(day)
     if seed:
-        print(f"检测到公众号参考素材：{len(seed)} 字（仅作选题启发，事实仍以白名单为准）")
+        print(f"检测到公众号参考素材：{len(seed)} 字（仅作选题启发，事实仍以白名单为准）", flush=True)
     print(f"采集 {day}（上期卡型={prev_type or '无'}）模型={model}")
 
     search_ctx = []
@@ -625,9 +631,9 @@ def main():
     if use_kimi:
         if model == DEFAULT_MODEL:  # 用户未显式指定模型时给 Kimi 默认
             model = "kimi-k2.6"
-        print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model}")
+        print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model}", flush=True)
     elif use_tavily:
-        print("检索模式：Tavily（限定白名单域名 + 近 2 日新闻）")
+        print("检索模式：Tavily（限定白名单域名 + 近 2 日新闻）", flush=True)
         _d = date.fromisoformat(day)
         _dc = f"{_d.year}年{_d.month}月{_d.day}日"
         queries = [
@@ -636,13 +642,17 @@ def main():
             f"{_dc} 社会民生 澎湃新闻 新京报", f"{_dc} 文体资讯 影视 体育 音乐",
             f"{_dc} 热搜 微博 抖音 百度",
         ]
-        for q in queries:
+        for idx, q in enumerate(queries, 1):
+            print(f"  Tavily 查询 {idx}/{len(queries)}: {q}", flush=True)
             try:
-                search_ctx += tavily_search(q, tavily_key, max_results=4, days=2)
+                res = tavily_search(q, tavily_key, max_results=4, days=2)
+                search_ctx += res
+                print(f"    返回 {len(res)} 条", flush=True)
             except Exception as e:
-                print("  Tavily 检索失败:", e)
+                print(f"    Tavily 检索失败: {e}", flush=True)
+        print(f"Tavily 总计检索到 {len(search_ctx)} 条上下文", flush=True)
     else:
-        print("检索模式：Gemini 联网搜索（googleSearch grounding）")
+        print("检索模式：Gemini 联网搜索（googleSearch grounding）", flush=True)
 
     tools = None
     if not use_tavily and not use_kimi and "googleapis.com" in base_url and search_mode != "none":
@@ -654,7 +664,7 @@ def main():
             "ERROR: 未配置任何真实联网检索（TAVILY_API_KEY 未设且非 Kimi/Google 搜索模式），"
             "为避免编造虚假新闻，已拒绝生成。请在 GitHub Secrets 配置 TAVILY_API_KEY 并将 SEARCH_MODE 设为 tavily。"
         )
-        print(msg)
+        print(msg, flush=True)
         try:
             with open("news_wechat/output/_collect_error.txt", "w", encoding="utf-8") as f:
                 f.write(msg + f"\ndate={day}\n")
@@ -666,9 +676,9 @@ def main():
     data = None
     last_err = ""
     last_raw = ""
-    for attempt in range(5):
+    for attempt in range(3):
         sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
-        print(f"第 {attempt+1} 次生成…")
+        print(f"第 {attempt+1}/3 次生成…", flush=True)
         try:
             if use_kimi:
                 raw = kimi_chat(sys_p, usr_p, base_url, api_key, model)
@@ -682,21 +692,23 @@ def main():
             cand = json.loads(raw)
         except Exception as e:
             last_err = str(e)
-            print("  解析失败:", e)
+            print("  解析失败:", e, flush=True)
             errors = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
             continue
 
         errors = validate(cand, cfg)
         if errors:
-            print("  校验未过：", errors[0])
+            print("  校验未过：", errors[0], flush=True)
             continue
         fresh = check_freshness(cand, day)
         if fresh:
-            print("  时效性校验未过：", fresh[0])
+            print("  时效性校验未过：", fresh, flush=True)
+            errors = [f"时效性校验未过：{fresh}"]
+            last_err = errors[-1]
             continue
         if audit_block(cand, day) > 0:
             errors = ["内容触发合规 BLOCK，请改用更中性的表述后重试"]
-            print("  合规 BLOCK，重试")
+            print("  合规 BLOCK，重试", flush=True)
             continue
         data = cand
         break
@@ -710,10 +722,10 @@ def main():
             )
             with open(err_path, "w", encoding="utf-8") as f:
                 f.write(diag)
-            print("已写诊断到", err_path)
+            print("已写诊断到", err_path, flush=True)
         except Exception:
             pass
-        print("ERROR: 3 次尝试仍未生成合规内容：", errors)
+        print("ERROR: 3 次尝试仍未生成合规内容：", errors, flush=True)
         sys.exit(1)
 
     # 农历由代码计算，避免模型误差
