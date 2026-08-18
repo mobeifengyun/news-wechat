@@ -126,7 +126,7 @@ jobs:
 
       - name: 生成手机页
         if: ${{ steps.check.outputs.skip != 'true' }}
-        run: python news_wechat/mobile.py
+        run: python news_wechat/mobile.py "${{ steps.check.outputs.day }}"
 
       - name: 部署手机页到 GitHub Pages
         if: ${{ steps.check.outputs.skip != 'true' }}
@@ -152,7 +152,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$(pwd)"
           git config pull.rebase true
-          git add news_wechat/output news_wechat/mobile_dist
+          git add news_wechat/output
           if git diff --cached --quiet; then
             echo "无产出变更，跳过提交"
             exit 0
