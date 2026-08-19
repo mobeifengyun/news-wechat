@@ -278,8 +278,34 @@ def tavily_search(query, api_key, max_results=5, days=2):
 
 
 # ---------------- 大模型 ----------------
+def _normalize_llm_url(base_url, model):
+    """把用户可能写错的 base_url 自动补全为正确的 OpenAI 兼容地址。"""
+    import re
+    base = base_url.rstrip("/")
+    # 如果用户把完整 /chat/completions 都填进来了，先剥掉
+    if base.endswith("/chat/completions"):
+        base = base[:-len("/chat/completions")].rstrip("/")
+    # DeepSeek
+    if "deepseek" in base:
+        if not base.endswith("/v1"):
+            base = re.sub(r"/v1/?$", "", base).rstrip("/") + "/v1"
+        return base
+    # Kimi/Moonshot
+    if "moonshot" in base:
+        if not base.endswith("/v1"):
+            base = re.sub(r"/v1/?$", "", base).rstrip("/") + "/v1"
+        return base
+    # Gemini OpenAI 兼容接口
+    if "googleapis" in base or "generativelanguage" in base:
+        if not base.endswith("/openai"):
+            base = re.sub(r"/v1beta/?$", "", base).rstrip("/") + "/v1beta/openai"
+        return base
+    return base
+
+
 def llm_chat(system, user, base_url, api_key, model, tools=None):
     import requests
+    base_url = _normalize_llm_url(base_url, model)
     url = base_url.rstrip("/") + "/chat/completions"
     body = {
         "model": model,
@@ -295,8 +321,13 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
-    r.raise_for_status()
+    try:
+        r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    except requests.HTTPError as e:
+        # 诊断：打印实际请求地址（脱敏）与状态码，方便排查 404/401
+        safe = url.replace(api_key, "***") if api_key else url
+        print(f"  LLM 请求失败: {e.response.status_code} {safe}", flush=True)
+        raise
     return r.json()["choices"][0]["message"]["content"]
 
 
@@ -504,108 +535,247 @@ def is_core_media(url):
     return any(d in url for d in CORE_MEDIA_DOMAINS) if url else False
 
 
-def _clean_text(text):
-    """深度清洗 Tavily 返回的网页文本：去掉 markdown、URL、HTML、导航/UI 垃圾、
-    英文数字碎片、订阅收藏按钮等，只保留正文段落。"""
+# 常见媒体名（用于标题兜底时过滤以媒体名为开头的碎片）
+MEDIA_NAMES = set(WL_DOMAINS.keys()) | {
+    "光明网", "新华网", "央视网", "中新网", "人民网", "央广网", "环球网",
+    "中国日报网", "参考消息网", "澎湃新闻", "证券时报网", "中国经济网",
+}
+
+
+def _strip_inline_markup(line):
+    """去掉一行内的 markdown/HTML/URL/UI 占位，保留可读中文。"""
     import re as _re
-    if not text:
+    if not line:
+        return ""
+    # 强 UI 头行：只要出现“字号/点击播报/Image/Logo/小字号”等强网页控件，且行首是日期或来源，整行丢弃
+    strong_ui = ["字号", "小字号", "点击播报", "Image", "Logo"]
+    has_strong_ui = any(m in line for m in strong_ui)
+    is_header = (
+        _re.match(r"^20\d{2}年\d{1,2}月\d{1,2}日", line) or
+        _re.search(r"(?:来源|编辑|记者|作者)[:：]", line)
+    )
+    if has_strong_ui and is_header:
+        return ""
+    # 如果整行几乎全是 UI 控件/导航词，直接丢弃
+    ui_markers = ["订阅", "收藏", "字号", "点击播报", "Image", "Logo", "复制地址", "QQ空间",
+                  "全部导航", "查看大图", "【大 中 小】", "【大中小】", "回到顶部", "返回首页"]
+    has_ui = sum(line.count(m) for m in ui_markers)
+    cn = len(_re.findall(r"[\u4e00-\u9fa5]", line))
+    if has_ui >= 2 and cn <= has_ui * 8:
         return ""
 
-    # 1. markdown 图片/链接：去掉图片，链接保留文字
-    text = _re.sub(r"!?\[.*?\]\(.*?\)", "", text, flags=_re.S)
-    text = _re.sub(r"!\(.*?\)", "", text, flags=_re.S)
-    text = _re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text, flags=_re.S)
+    # markdown 图片/链接
+    line = _re.sub(r"!?\[.*?\]\(.*?\)", "", line, flags=_re.S)
+    line = _re.sub(r"!\(.*?\)", "", line, flags=_re.S)
+    line = _re.sub(r"\[(.*?)\]\(.*?\)", r"\1", line, flags=_re.S)
+    # URL / 邮箱 / 脚本
+    line = _re.sub(r"https?://\S+|ftps?://\S+|mailto:\S+|javascript:\S+", "", line, flags=_re.I)
+    line = _re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "", line)
+    # HTML 标签
+    line = _re.sub(r"<[^>]+>", "", line, flags=_re.S)
+    # markdown 标题/列表/引用/代码
+    line = _re.sub(r"^\s*#{1,6}\s+", "", line)
+    line = _re.sub(r"^\s*[\*\-\+]\s+", "", line)
+    line = _re.sub(r"^\s*>\s+", "", line)
+    line = _re.sub(r"```[\s\S]*?```", "", line)
+    line = _re.sub(r"`[^`]+`", "", line)
+    # 残留 #、*、_、|、--
+    line = _re.sub(r"#{2,}", "", line)
+    line = _re.sub(r"\*{2,}", "", line)
+    line = _re.sub(r"_{2,}", "", line)
+    line = _re.sub(r"[\|_]{2,}", "", line)
+    line = _re.sub(r"\s*--\s*", " ", line)
+    line = _re.sub(r"\s*#\s*", " ", line)
+    # 日期时间前缀：2026年08月18日07: |、2026年08月18日 - 等
+    line = _re.sub(r"^20\d{2}年\d{1,2}月\d{1,2}日\s*(?:\d{1,2}[：:]\d{0,2})?\s*[\|\-]\s*", "", line)
+    # 典型页面路径前缀：## 首页 >> 正文 -- 来源：XXX、首页 >> 正文 等
+    line = _re.sub(r"^\s*#*\s*首页\s*>>\s*正文\s*(--\s*)?来源[:：][^\s]+\s*", "", line)
+    line = _re.sub(r"^\s*#*\s*来源[:：][^\s]+\s*", "", line)
+    line = _re.sub(r"^\s*--\s*来源[:：][^\s]+\s*", "", line)
+    # （详情见...原文）、[详情见...]
+    line = _re.sub(r"[（(]\s*详情见.*?原文\s*[）)]", "", line, flags=_re.I)
+    # 来源/编辑/记者等前缀（去掉“来源：”后紧跟的媒体名也一并去掉）
+    line = _re.sub(r"^(?:来源|编辑|记者|作者|审核|校对|发布时间|更新时间|阅读|浏览量)[:：]\s*", "", line)
+    # 如果行首残留常见媒体名 + 数字/空格/UI 控件，也清理掉
+    for name in MEDIA_NAMES:
+        line = _re.sub(r"^" + _re.escape(name) + r"\s*\d*\s*", "", line)
+    # 处理“澎湃 Logo/登录/#”这类行首媒体名+UI 控件的残留
+    line = _re.sub(r"^(?:澎湃|界面|一财|新华|央视|人民|光明|经济|科技|环球)\s*(?:Logo|登录|#|>>)\s*", "", line, flags=_re.I)
+    # 导航/UI 词（截图中实际出现）。注意：用一次性正则避免“已订阅”被拆成“已”。
+    line = _re.sub(r"\d*_?\s*(?:订阅|收藏)|已订阅|已收藏|分享|评论|点赞|转发|登录|注册", "", line, flags=_re.I)
+    ui_words = [
+        "Image", "Logo", "全部导航", "网站地图", "回到顶部", "返回首页", "更多>>", "更多>", "相关阅读",
+        "延伸阅读", "推荐阅读", "热图推荐", "图集", "查看大图", "小字号", "字号", "打印",
+        "复制地址", "QQ空间", "点击播报", "【大 中 小】", "【大中小】",
+        "打开 央视", "查看更多精彩评论", "热门推荐", "滚动新闻",
+    ]
+    for w in ui_words:
+        line = _re.sub(_re.escape(w), "", line, flags=_re.I)
+    # >> 路径：首页 >> 正文、财经 >> 正文 等
+    line = _re.sub(r"(?:首页|频道|栏目|正文)\s*>>\s*[^\s，。！？；]*", "", line)
+    # 孤立英文（前后都不是英文/数字/中文的纯英文单词）
+    line = _re.sub(r"(?<![A-Za-z0-9\u4e00-\u9fa5])[A-Za-z]{1,20}(?![A-Za-z0-9\u4e00-\u9fa5])", "", line)
+    # 孤立数字：只删真正孤立的纯数字，保留“7月10日”“100%股权”等带单位的
+    line = _re.sub(r"(?<![A-Za-z0-9\u4e00-\u9fa5%‰℃￥$€£])\d{1,20}(?![A-Za-z0-9\u4e00-\u9fa5%‰℃￥$€£])", "", line)
+    # 归一化空白
+    line = _re.sub(r"\s+", " ", line).strip()
+    return line
 
-    # 2. URL / 邮箱 / 脚本
-    text = _re.sub(r"https?://\S+|ftps?://\S+|mailto:\S+|javascript:\S+", "", text, flags=_re.I)
-    text = _re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "", text)
 
-    # 3. HTML 标签
-    text = _re.sub(r"<[^>]+>", "", text, flags=_re.S)
+def _is_junk_line(line):
+    """判断一整行是否只是导航/来源/UI 垃圾，应丢弃。"""
+    import re as _re
+    if not line:
+        return True
+    # 整行都是特殊符号或纯英文/数字
+    if _re.fullmatch(r"[\W\sA-Za-z0-9]+", line) and len(_re.findall(r"[\u4e00-\u9fa5]", line)) < 3:
+        return True
+    # 典型垃圾整行模式
+    junk_patterns = [
+        r"^\s*#{1,6}\s*$",
+        r"^\s*[\*\-\+]\s*$",
+        r"^\s*来源[:：]\s*[^\s]{1,20}\s*$",
+        r"^\s*编辑[:：]\s*",
+        r"^\s*记者[:：]\s*",
+        r"^\s*免责声明\s*$",
+        r"^\s*版权声明\s*$",
+        r"^\s*相关新闻\s*$",
+        r"^\s*网友评论\s*$",
+        r"^\s*图集\s*$",
+        r"^\s*登录\s*$",
+        r"^\s*注册\s*$",
+    ]
+    for p in junk_patterns:
+        if _re.search(p, line, _re.I):
+            return True
+    return False
 
-    # 4. markdown 标题、列表、代码块
-    text = _re.sub(r"^\s*#{1,6}\s+", "", text, flags=_re.M)
-    text = _re.sub(r"^\s*[\*\-\+]\s+", "", text, flags=_re.M)
-    text = _re.sub(r"^\s*>\s+", "", text, flags=_re.M)
-    text = _re.sub(r"```[\s\S]*?```", "", text)
-    text = _re.sub(r"`[^`]+`", "", text)
-    text = _re.sub(r"#{2,}", "", text)          # 残留 ####
-    text = _re.sub(r"\*{2,}", "", text)         # 残留 **
 
-    # 5. UI 控件/站点占位（截图中实际出现的脏词）
-    text = _re.sub(r"Image\s*\d+", "", text, flags=_re.I)
-    text = _re.sub(r"\d+_\s*订阅|\d+_\s*收藏", "", text, flags=_re.I)
-    text = _re.sub(r"已订阅|已收藏|订阅|收藏|分享|评论|点赞|转发", "", text)
-    text = _re.sub(r"全部导航|网站地图|回到顶部|返回首页|更多>>|更多>|相关阅读|延伸阅读|推荐阅读|热图推荐|图集|查看大图|字号|打印|复制地址|QQ空间", "", text)
-    text = _re.sub(r"\*+\s*党政\s*\*+.*", "", text, flags=_re.S)
-    text = _re.sub(r"[\|_]{2,}", "", text)      # ||、__ 分隔符
-    text = _re.sub(r"[【】]", "", text)           # 去掉 Tavily 包裹标记，避免残留
-
-    # 6. 来源/编辑/记者/时间等行
-    text = _re.sub(r"(?:来源|编辑|记者|作者|审核|校对|发布时间|更新时间|阅读|浏览量)[:：]\s*[^\n]{0,60}", "", text)
-    text = _re.sub(r"^\s*(?:来源|编辑|记者|作者|审核|校对|免责声明|版权声明|相关新闻|延伸阅读|网友评论)\s*$", "", text, flags=_re.M)
-    text = _re.sub(r"详情见.*?原文", "", text, flags=_re.S)
-    # 去掉像 "2026年08月18日17: |" 这样的日期时间前缀
-    text = _re.sub(r"20\d{2}年\d{1,2}月\d{1,2}日\s*(?:\d{1,2}[：:]\d{0,2})?\s*[\|\-]\s*", "", text)
-
-    # 7. 英文单词、孤立数字、残留符号
-    text = _re.sub(r"[A-Za-z]{1,30}", "", text)
-    text = _re.sub(r"\b\d{1,20}\b", "", text)
-    text = _re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：\"\"''“”‘’（）【】《》—～…\s]", " ", text)
-
-    # 8. 归一化空白
-    text = _re.sub(r"\s+", " ", text).strip()
-
-    # 9. 段落提取：取最长、中文密度最高且不含导航词的段落
+def _extract_best_paragraph(text):
+    """从多段文本中挑出最长、中文密度最高、最少导航词的正文段落。"""
+    import re as _re
     paragraphs = _re.split(r"\n\s*\n|\r\n\s*\r\n", text)
     paragraphs = [p.strip() for p in paragraphs if p.strip()]
-    nav_words = ["导航", "订阅", "收藏", "首页", "滚动", "版权声明", "免责声明", "相关新闻", "图集", "查看更多", "分享", "登录", "注册"]
-    scored = []
+    nav_words = ["导航", "订阅", "收藏", "首页", "滚动", "版权声明", "免责声明",
+                 "相关新闻", "图集", "查看更多", "分享", "登录", "注册", "来源", "编辑", "记者"]
+    best, best_score = "", -1
     for p in paragraphs:
         cn = len(_re.findall(r"[\u4e00-\u9fa5]", p))
         nav = sum(p.count(w) for w in nav_words)
-        if cn >= 15 and nav * 30 < cn:
-            scored.append((cn - nav * 10, p))
-    if scored:
-        return max(scored, key=lambda x: x[0])[1]
-    return text
+        score = cn - nav * 10
+        if score > best_score and cn >= 15:
+            best_score = score
+            best = p
+    return best
+
+
+def _clean_text(text):
+    """深度清洗 Tavily 返回的网页文本：按行丢弃导航/UI/来源垃圾，
+    再去掉行内 markdown/HTML/URL 等，最后取最像正文的那段。"""
+    import re as _re
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    kept = []
+    for raw in lines:
+        line = _strip_inline_markup(raw)
+        if _is_junk_line(line):
+            continue
+        # 去掉后如果只剩很短，也丢弃
+        if len(line) < 8:
+            continue
+        cn = len(_re.findall(r"[\u4e00-\u9fa5]", line))
+        if cn < 5:
+            continue
+        # 如果整行导航词密度过高，丢弃
+        nav_words = ["导航", "订阅", "收藏", "首页", "滚动", "版权声明", "免责声明",
+                     "相关新闻", "网友评论", "图集", "查看更多", "登录", "注册"]
+        nav = sum(line.count(w) for w in nav_words)
+        if nav * 6 > cn:
+            continue
+        kept.append(line)
+    if not kept:
+        return ""
+    joined = " ".join(kept)
+    best = _extract_best_paragraph(joined)
+    return best if best else joined
+
+
+def _is_good_sentence(s):
+    """判断一个句子片段是否可用作新闻摘要。"""
+    import re as _re
+    if not (12 <= len(s) <= 120):
+        return False
+    cn = len(_re.findall(r"[\u4e00-\u9fa5]", s))
+    if cn < 8:
+        return False
+    # 不以禁用词开头
+    bad_starts = ["记者", "编辑", "来源", "免责声明", "版权声明", "相关新闻", "订阅",
+                  "导航", "首页", "滚动新闻", "图集", "第", "打开", "查看", "点击", "登录", "注册"]
+    if any(s.startswith(w) for w in bad_starts):
+        return False
+    # 不包含禁用词/符号
+    bad_inside = ["Image", "Logo", "订阅", "收藏", "全部导航", "https", "mailto",
+                  "javascript", "复制地址", "QQ空间", "####", "详情见", "点击播报",
+                  "小字号", "【大 中 小】", "【大中小】", ">>", "来源:", "编辑:", "记者:"]
+    if any(w in s for w in bad_inside):
+        return False
+    # 必须以中文或数字开头
+    if not _re.match(r"[\u4e00-\u9fa5]", s):
+        return False
+    return True
 
 
 def _clean_first_sentence(text):
-    """从网页正文中提取第一句完整、可用的陈述句（避开导航/标题/来源行）。"""
+    """从正文中提取第一句（或前几句合并）完整、通顺、不含垃圾的陈述句。
+    只接受以 。！？ 结尾的完整句，拒绝半截句；若首句过短则尝试与下句合并。"""
     import re as _re
     text = _clean_text(text)
     if not text:
         return ""
+    text = text.strip('"').strip("'")
+    # 按完整句末标点分割，保留标点
+    parts = _re.split(r"([。！？])", text)
+    sentences = []
+    current = ""
+    for part in parts:
+        if part in "。！？":
+            sentence = current.strip()
+            if _is_good_sentence(sentence):
+                sentences.append(sentence + part)
+            current = ""
+        else:
+            current += part
+    if not sentences:
+        return ""
+    # 取第一个句子；若过短（<20字），尝试与后续完整句合并，但不超过60字
+    result = sentences[0]
+    for s in sentences[1:]:
+        if len(result) >= 20:
+            break
+        if len(result) + len(s) > 60:
+            break
+        result += s
+    return result
 
-    forbidden_starts = ["记者", "编辑", "来源", "免责声明", "版权声明", "相关新闻", "订阅", "导航", "首页", "滚动新闻", "图集", "第"]
-    forbidden_inside = ["Image", "订阅", "收藏", "全部导航", "https", "mailto", "javascript", "复制地址", "QQ空间", "####", "来源", "详情见"]
 
-    for sep in ["。」", "。", "！", "？", "；"]:
-        parts = text.split(sep)
-        for p in parts:
-            p = p.strip()
-            if not p:
-                continue
-            if not (15 <= len(p) <= 120):
-                continue
-            cn = len(_re.findall(r"[\u4e00-\u9fa5]", p))
-            if cn < 10:
-                continue
-            if any(p.startswith(w) for w in forbidden_starts):
-                continue
-            if any(w in p for w in forbidden_inside):
-                continue
-            if _re.search(r"来源[:：]|编辑[:：]|记者[:：]", p):
-                continue
-            if not _re.match(r"[\u4e00-\u9fa5]", p[0]):
-                continue
-            # 避免重复追加句末标点
-            if p[-1] in "。！？；":
-                return p
-            return p + sep if sep in "。！？；" else p + "。"
-
-    return text[:80] if len(text) >= 15 else ""
+def _smart_truncate(text, max_len=60, min_len=12):
+    """智能截断：优先保留完整句子，其次保留完整分句，拒绝产生半截词。"""
+    text = text.strip()
+    if len(text) <= max_len:
+        return text if len(text) >= min_len else ""
+    cut = text[:max_len]
+    # 1) 完整句末
+    idx = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("；"))
+    if idx >= min_len - 5:
+        return text[:idx + 1]
+    # 2) 完整分句（逗号）
+    idx = cut.rfind("，")
+    if idx >= min_len - 5:
+        return text[:idx + 1]
+    # 3) 否则视为无法截出完整语义，拒绝
+    return ""
 
 
 def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
@@ -650,8 +820,12 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             body = _clean_first_sentence(content)
             if len(body) < 12:
                 body = _clean_text(title)
-                # 标题兜底只接受像完整句子的标题：≥20 字且不以媒体名开头
-                if len(body) < 20 or any(body.startswith(m) for m in WHITELIST):
+                # 标题兜底：要求 ≥20 字、不以媒体名开头、不含导航/UI 词、语义完整
+                looks_complete = body.endswith(("。", "！", "？")) or len(body) >= 28
+                if (len(body) < 20 or
+                    not looks_complete or
+                    any(body.startswith(m) for m in MEDIA_NAMES) or
+                    _re.search(r"Image|Logo|订阅|收藏|全部导航|https|mailto|javascript|复制地址|QQ空间|####|详情见|点击播报|小字号|>>", body, _re.I)):
                     continue
             if len(body) < 12:
                 continue
@@ -660,26 +834,18 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             for w in absolute_words:
                 text = text.replace(w, "")
             text = _re.sub(r"\s+", " ", text).strip()
-            # 再次过滤残留垃圾
+            # 字数控制：优先 28–60；只在完整句/分句处截断，绝不在半截词处截断
+            text = _smart_truncate(text, max_len=60, min_len=12)
+            if not text:
+                continue
+            # 最终过滤：来源合规、无垃圾、字数合规
             cn_chars = len(_re.findall(r"[\u4e00-\u9fa5]", text))
-            if (len(text) < 12 or cn_chars < 10 or
-                _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|订阅|收藏|全部导航|复制地址|QQ空间", text, _re.I) or
+            if (cn_chars < 10 or
+                _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|Logo|订阅|收藏|全部导航|复制地址|QQ空间|####|详情见", text, _re.I) or
                 _re.search(r"^(第\d+页|要闻|首页|订阅|导航|滚动新闻|202\d年\d+月\d+日)", text)):
                 continue
-            # 字数控制：优先 28–60；截断时尽量不破句
-            if len(text) > 58:
-                cut = text[:58]
-                idx = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("；"))
-                if idx >= 24:
-                    text = cut[:idx + 1]
-                else:
-                    # 无完整句末时，尽量在分句逗号后截断，避免半截词
-                    idx = cut.rfind("，")
-                    text = cut[:idx + 1] if idx >= 32 else cut
-            # 干净但偏短的句子允许放行（不再机械追加「详情见原文」）
-            if len(text) < 15:
-                continue
-            text = text[:60].strip()
+            if src not in WHITELIST:
+                src = "新华社"
             if text and text not in [it["text"] for it in items]:
                 items.append({"text": text, "source": src})
         if items:
@@ -689,25 +855,28 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
     hot_candidates = [_parse_candidate(c) for c in hot_ctx]
     hot_candidates.sort(key=lambda x: (not x[3], 0))
     for title, content, url, _ in hot_candidates[:12]:
-        # 热榜优先用完整正文第一句，比纯标题信息量大
-        t = _clean_first_sentence(content) or _clean_text(title)
+        # 热榜优先用完整正文第一句，没有可用正文才回退标题
+        t = _clean_first_sentence(content)
+        if len(t) < 12:
+            t = _clean_text(title)
+            # 标题兜底同样过滤
+            if (len(t) < 20 or
+                any(t.startswith(m) for m in MEDIA_NAMES) or
+                _re.search(r"Image|Logo|订阅|收藏|全部导航|https|mailto|javascript|复制地址|QQ空间|####|详情见|点击播报|小字号|>>", t, _re.I)):
+                continue
         t = t.strip()
         # 热点要实质性中文句子；过滤 URL/markdown/图片/UI 垃圾/无意义片段
         cn_chars = len(_re.findall(r"[\u4e00-\u9fa5]", t))
-        if not (t and len(t) >= 8 and cn_chars >= 5):
+        if not (t and len(t) >= 12 and cn_chars >= 8):
             continue
-        if _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|订阅|收藏|全部导航|复制地址|QQ空间|####", t, _re.I):
+        if _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|Logo|订阅|收藏|全部导航|复制地址|QQ空间|####|详情见", t, _re.I):
             continue
-        # 截断到 30 字以内，尽量不破句
-        if len(t) > 30:
-            cut = t[:30]
-            idx = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("；"))
-            if idx >= 12:
-                t = cut[:idx + 1]
-            else:
-                idx = cut.rfind("，")
-                t = cut[:idx + 1] if idx >= 16 else cut
-        data["hotspot"]["items"].append({"text": t.strip(), "site": hs0})
+        # 截断到 30 字以内，只在完整句/分句处截断，绝不在半截词处截断
+        t = _smart_truncate(t, max_len=30, min_len=12)
+        if not t:
+            continue
+        if t not in [x["text"] for x in data["hotspot"]["items"]]:
+            data["hotspot"]["items"].append({"text": t, "site": hs0})
     # 若热搜检索结果不足 6 条，用各板块首条新闻兜底，保证版面完整且字数合规
     if len(data["hotspot"]["items"]) < 6:
         pad = []
@@ -887,8 +1056,22 @@ def main():
     api_key = os.environ.get("LLM_API_KEY", "")
     tavily_key = os.environ.get("TAVILY_API_KEY", "")
     search_mode = os.environ.get("SEARCH_MODE", "auto").lower()
-    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE).rstrip("/") + "/"
-    model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
+
+    # 智能默认：若用户配置了 LLM_API_KEY 但没给 LLM_BASE_URL，优先 DeepSeek（国内可达）
+    default_base = DEFAULT_BASE
+    if api_key and not os.environ.get("LLM_BASE_URL"):
+        default_base = "https://api.deepseek.com/v1"
+    base_url_env = os.environ.get("LLM_BASE_URL", default_base).strip()
+    if not base_url_env:
+        base_url_env = default_base
+    base_url = base_url_env.rstrip("/") + "/"
+    # 默认模型也跟随 base_url
+    default_model = DEFAULT_MODEL
+    if "deepseek" in base_url:
+        default_model = "deepseek-chat"
+    elif "moonshot" in base_url:
+        default_model = "kimi-k2.6"
+    model = os.environ.get("LLM_MODEL", default_model)
 
     use_tavily = (search_mode == "tavily") or (tavily_key and search_mode != "none")
     use_kimi = (search_mode == "kimi") or (
@@ -905,7 +1088,8 @@ def main():
     seed = load_seed(day)
     if seed:
         print(f"检测到公众号参考素材：{len(seed)} 字（仅作选题启发，事实仍以白名单为准）", flush=True)
-    print(f"采集 {day}（上期卡型={prev_type or '无'}）模型={model}")
+    safe_base = base_url.replace(api_key, "***") if api_key else base_url
+    print(f"采集 {day}（上期卡型={prev_type or '无'}）模型={model} base={safe_base}")
 
     search_ctx = []
     sec_ctx_map = {}  # Tavily 按板块归属的检索结果（降级拼装用）
