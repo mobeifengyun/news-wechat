@@ -3,20 +3,12 @@ name: 报简说·每日生成与发布（云端全自动）
 # 定位：完全在 GitHub 云端运行，不依赖本机 WorkBuddy 客户端与本机网络。
 # 每天北京时间 07:00 自动：采集 → 渲染+审核 → (可选)公众号群发 → 手机页 → 部署 GitHub Pages → ServerChan 推送。
 # 计算免费（GitHub Free 私有库 2000 分钟/月，本流程约 2-3 分钟/天，远低于额度）。
-# 当前推荐配置（零费用、国内可达）：OpenRouter 免费模型 deepseek/deepseek-chat:free + Tavily 联网检索（白名单域名 + 近 2 日）。
-# 四级自动替补：主模型 → 同平台免费备援(qwen/llama/gemma :free) → 跨平台备援(LLM2_*/LLM3_*) → Tavily 规则拼装兜底，
-#   保证当天至少产出一份真实新闻、绝不编造。
+# 联网搜索与成稿由大模型 API 完成（默认 Gemini 免费额度，或 DeepSeek+Tavily，约 ¥0.1/月）。
 
 on:
   schedule:
     - cron: '0 23 * * *'        # UTC 23:00 = 北京时间 07:00
   workflow_dispatch:            # 手动触发（Actions 页面 → Run workflow）
-    inputs:
-      force:
-        description: '强制重新生成并推送（忽略当日已生成/已部署检查）'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write               # 提交产出（跨期查重 + 历史归档）
@@ -73,11 +65,6 @@ jobs:
         run: |
           DAY=$(python -c "from datetime import datetime,timedelta,timezone; print(datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d'))")
           echo "day=$DAY" >> "$GITHUB_OUTPUT"
-          # 强制重新生成：勾选 force 时忽略所有幂等检查
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            echo "force=true，忽略幂等检查，重新生成并推送"
-            exit 0
-          fi
           # 1) main 已有产出 -> 跳过（含推送）
           if [ -f "news_wechat/output/news_${DAY}.json" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -102,14 +89,13 @@ jobs:
           PY
           if [ -f /tmp/_skip_flag ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
 
-      - name: 采集 + 成稿（大模型联网搜索 + Tavily 检索）
+      - name: 采集 + 成稿（大模型联网搜索）
         id: collect
         if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
-          # 跨平台备援供应商（四级替补链之 LLM2_*/LLM3_*），未配置则为空、自动跳过，不影响主链路
           LLM2_API_KEY: ${{ secrets.LLM2_API_KEY }}
           LLM2_BASE_URL: ${{ secrets.LLM2_BASE_URL }}
           LLM2_MODEL: ${{ secrets.LLM2_MODEL }}
@@ -147,7 +133,7 @@ jobs:
 
       - name: 生成手机页
         if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
-        run: python news_wechat/mobile.py "${{ steps.check.outputs.day }}"
+        run: python news_wechat/mobile.py
 
       - name: 部署手机页到 GitHub Pages
         if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
@@ -173,7 +159,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$(pwd)"
           git config pull.rebase true
-          git add news_wechat/output
+          git add news_wechat/output news_wechat/mobile_dist
           if git diff --cached --quiet; then
             echo "无产出变更，跳过提交"
             exit 0

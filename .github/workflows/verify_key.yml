@@ -1,9 +1,9 @@
-name: 密钥自检（LLM / Tavily / ServerChan）
+name: 密钥自检（大模型 / Tavily / ServerChan）
 
-# 用途：随时手动点一下，确认 GitHub Secrets 里的密钥还有没有效。
-# 覆盖：大模型密钥（LLM_API_KEY/LLM_BASE_URL/LLM_MODEL）、Tavily 检索密钥、ServerChan（可选）。
+# 用途：随时手动点一下，10 秒内确认 GitHub Secrets 里的密钥还有没有效。
 # 只发一次极简请求，不采集、不生成、不推送真实内容，绝不干扰当日期次。
-# 场景：换了 Kimi Key 想立刻确认；或某天没收到推送，先来这里排查是不是密钥过期。
+# 场景：换了 Key 想立刻确认；或某天没收到推送，先来这里排查是不是密钥过期。
+# 注：OpenRouter/DeepSeek 等无内置搜索的模型必须配 Tavily，故 Tavily 检测为刚需。
 
 on:
   workflow_dispatch:
@@ -84,34 +84,40 @@ jobs:
           sys.exit(1)
           PY
 
-      - name: 检测 Tavily 检索密钥（OpenRouter/DeepSeek 方案必需）
-        if: ${{ !cancelled() }}
-        continue-on-error: true
+      - name: 检测 Tavily 检索密钥（OpenRouter 方案刚需）
         env:
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
         run: |
           python - <<'PY'
           import os, sys, requests
           key = os.environ.get('TAVILY_API_KEY', '').strip()
+          print('=' * 46)
+          print('Tavily Key:', (key[:6] + '****' + key[-4:]) if len(key) > 12 else ('（空！Secret 没配）' if not key else '****'))
+          print('=' * 46)
           if not key:
-              print('ℹ️ TAVILY_API_KEY 为空。若主模型用 OpenRouter/DeepSeek 等无内置搜索供应商，'
-                    '云端会因「空检索硬熔断」直接不出报；此时必须配置 Tavily（建议 SEARCH_MODE=tavily）。')
-              sys.exit(0)
+              print('❌ TAVILY_API_KEY 为空。OpenRouter/DeepSeek 等无内置搜索的模型必须配 Tavily，否则无法检索新闻。')
+              sys.exit(1)
           try:
               r = requests.post(
                   'https://api.tavily.com/search',
-                  json={'api_key': key, 'query': '今日新闻 新华社', 'max_results': 1, 'topic': 'news', 'days': 1},
+                  json={'api_key': key, 'query': '今日要闻', 'max_results': 1, 'topic': 'news', 'days': 1},
                   timeout=30,
               )
-              print('HTTP', r.status_code, r.text[:240])
-              if r.status_code == 200:
-                  print('✅ Tavily 密钥有效，可正常检索白名单域名近 2 日新闻。')
-                  sys.exit(0)
-              print('❌ Tavily 返回非 200，检查密钥或额度。')
-              sys.exit(0)
           except Exception as e:
-              print('⚠️ Tavily 请求失败（网络/密钥）：', e)
+              print('❌ 请求发不出去（网络问题）：', e)
+              sys.exit(1)
+          if r.status_code == 200:
+              try:
+                  n = len(r.json().get('results', []))
+              except Exception:
+                  n = -1
+              print(f'✅ Tavily 密钥有效，返回结果数：{n}')
               sys.exit(0)
+          print(f'❌ 失败：HTTP {r.status_code}')
+          print(r.text[:600])
+          if r.status_code == 401:
+              print('→ 401 = Tavily 密钥无效，去 app.tavily.com 重新生成并更新 Secret TAVILY_API_KEY。')
+          sys.exit(1)
           PY
 
       - name: 检测 ServerChan（可选，会真发一条微信）
