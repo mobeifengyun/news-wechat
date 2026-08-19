@@ -303,6 +303,10 @@ def _normalize_llm_url(base_url, model):
     return base
 
 
+class LLMAuthError(Exception):
+    """鉴权或额度类错误（401/402/403）：账号不可用，应立即降级、无需重试。"""
+
+
 def llm_chat(system, user, base_url, api_key, model, tools=None):
     import requests
     base_url = _normalize_llm_url(base_url, model)
@@ -326,9 +330,14 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
     try:
         r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
     except requests.HTTPError as e:
-        # 诊断：打印实际请求地址（脱敏）与状态码，方便排查 404/401
+        # 诊断：打印实际请求地址（脱敏）与状态码，方便排查 404/401/402
         safe = url.replace(api_key, "***") if api_key else url
-        print(f"  LLM 请求失败: {e.response.status_code} {safe}", flush=True)
+        code = getattr(e.response, "status_code", None)
+        if code in (401, 402, 403):
+            # 鉴权/额度失败：账号不可用，抛专属异常让主流程立即降级为规则拼装（不重试）
+            print(f"  LLM 鉴权/额度失败（{code}），将直接降级为 Tavily 规则拼装：{safe}", flush=True)
+            raise LLMAuthError(f"LLM 返回 {code}（{getattr(e.response, 'text', '')[:160]}）")
+        print(f"  LLM 请求失败: {code} {safe}", flush=True)
         raise
     resp = r.json()
     # 增强诊断：若返回的不是标准 OpenAI 格式，打印原始响应帮助排查 key/余额/模型错误
@@ -759,8 +768,9 @@ def _is_good_sentence(s):
     # 不包含只剩空括号
     if _re.search(r"[（(]\s*[）)]", s):
         return False
-    # 必须以中文开头
-    if not _re.match(r"[\u4e00-\u9fa5]", s):
+    # 必须以中文或数字（日期/年份/百分比，如“8月18日”“2026年”）开头，
+    # 拒绝英文/URL/符号开头；具体 junk 词已由 bad_starts 拦截（第/首页/导航等）
+    if not _re.match(r"[\u4e00-\u9fa5\d]", s):
         return False
     return True
 
@@ -822,8 +832,15 @@ def _smart_truncate(text, max_len=60, min_len=12):
             current = ""
         else:
             current += part
-    # 3) 实在没有完整句，拒绝
-    return ""
+    # 3) 退化兜底：整句超长且内部无句末时，在 max_len 内最后一个「分号>逗号」处断句并补句号，
+    #    宁可略带半截也绝不整条丢弃（兜底拼装以“不丢条、填满版面”为优先）
+    cut = text[:max_len]
+    for sep in ("；", "，", ",", ";"):
+        j = cut.rfind(sep)
+        if j >= min_len - 1:
+            return cut[:j] + "。"
+    # 4) 连逗号都没有，直接截断补句号（极端兜底）
+    return text[:max_len] + "。"
 
 
 def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
@@ -888,8 +905,8 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             for w in absolute_words:
                 text = text.replace(w, "")
             text = _re.sub(r"\s+", " ", text).strip()
-            # 字数控制：优先 28–60；只在完整句/分句处截断，绝不在半截词处截断
-            text = _smart_truncate(text, max_len=60, min_len=12)
+            # 字数控制：优先 28–66；只在完整句/分句处截断，绝不在半截词处截断
+            text = _smart_truncate(text, max_len=66, min_len=12)
             if not text:
                 continue
             # 最终过滤：来源合规、无垃圾、字数合规、必须以完整句末结尾
@@ -943,8 +960,9 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
         pad = []
         for sec in data["sections"]:
             for it in sec.get("items", []):
-                txt = it["text"][:58]
-                if 20 <= len(txt) <= 60 and txt not in [x["text"] for x in data["hotspot"]["items"]]:
+                # 用智能截断保证热点兜底也是完整句（绝不半截、绝不丢条）
+                txt = _smart_truncate(it["text"], max_len=30, min_len=12)
+                if txt and txt not in [x["text"] for x in data["hotspot"]["items"]]:
                     pad.append({"text": txt, "site": hs0})
         for p in pad:
             if len(data["hotspot"]["items"]) >= 12:
@@ -1247,6 +1265,10 @@ def main():
                 raw = m.group(0)
             cand = json.loads(raw)
         except Exception as e:
+            if isinstance(e, LLMAuthError):
+                # 鉴权/额度失败：跳过剩余重试，直接走规则拼装保底
+                last_err = str(e)
+                break
             last_err = str(e)
             print("  解析失败:", e, flush=True)
             errors = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
