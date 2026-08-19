@@ -3,7 +3,9 @@ name: 报简说·每日生成与发布（云端全自动）
 # 定位：完全在 GitHub 云端运行，不依赖本机 WorkBuddy 客户端与本机网络。
 # 每天北京时间 07:00 自动：采集 → 渲染+审核 → (可选)公众号群发 → 手机页 → 部署 GitHub Pages → ServerChan 推送。
 # 计算免费（GitHub Free 私有库 2000 分钟/月，本流程约 2-3 分钟/天，远低于额度）。
-# 联网搜索与成稿由大模型 API 完成（默认 Gemini 免费额度，或 DeepSeek+Tavily，约 ¥0.1/月）。
+# 当前推荐配置（零费用、国内可达）：OpenRouter 免费模型 deepseek/deepseek-chat:free + Tavily 联网检索（白名单域名 + 近 2 日）。
+# 四级自动替补：主模型 → 同平台免费备援(qwen/llama/gemma :free) → 跨平台备援(LLM2_*/LLM3_*) → Tavily 规则拼装兜底，
+#   保证当天至少产出一份真实新闻、绝不编造。
 
 on:
   schedule:
@@ -100,22 +102,30 @@ jobs:
           PY
           if [ -f /tmp/_skip_flag ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
 
-      - name: 采集 + 成稿（大模型联网搜索）
+      - name: 采集 + 成稿（大模型联网搜索 + Tavily 检索）
+        id: collect
         if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          # 跨平台备援供应商（四级替补链之 LLM2_*/LLM3_*），未配置则为空、自动跳过，不影响主链路
+          LLM2_API_KEY: ${{ secrets.LLM2_API_KEY }}
+          LLM2_BASE_URL: ${{ secrets.LLM2_BASE_URL }}
+          LLM2_MODEL: ${{ secrets.LLM2_MODEL }}
+          LLM3_API_KEY: ${{ secrets.LLM3_API_KEY }}
+          LLM3_BASE_URL: ${{ secrets.LLM3_BASE_URL }}
+          LLM3_MODEL: ${{ secrets.LLM3_MODEL }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           SEARCH_MODE: ${{ secrets.SEARCH_MODE }}
         run: python news_wechat/collect.py "${{ steps.check.outputs.day }}"
 
       - name: 渲染 + 合规审核（BLOCK 会中断）
-        if: ${{ steps.check.outputs.skip != 'true' }}
+        if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
         run: python news_wechat/render.py "${{ steps.check.outputs.day }}"
 
       - name: 注入公众号凭据并群发（可选，未配置则跳过）
-        if: ${{ steps.check.outputs.skip != 'true' }}
+        if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
         env:
           WX_APPID: ${{ secrets.WX_APPID }}
           WX_APPSECRET: ${{ secrets.WX_APPSECRET }}
@@ -136,11 +146,11 @@ jobs:
           fi
 
       - name: 生成手机页
-        if: ${{ steps.check.outputs.skip != 'true' }}
+        if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
         run: python news_wechat/mobile.py "${{ steps.check.outputs.day }}"
 
       - name: 部署手机页到 GitHub Pages
-        if: ${{ steps.check.outputs.skip != 'true' }}
+        if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -150,14 +160,14 @@ jobs:
           commit_message: "deploy: 手机页 ${{ github.run_id }}"
 
       - name: 推送 ServerChan 汇报
-        if: ${{ steps.check.outputs.skip != 'true' }}
+        if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
         env:
           PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
           SCKEY: ${{ secrets.SCKEY }}
         run: python news_wechat/push_sc.py "$PAGE_URL" "${{ steps.check.outputs.day }}"
 
       - name: 提交产出（供跨期查重与历史归档）
-        if: ${{ steps.check.outputs.skip != 'true' }}
+        if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
