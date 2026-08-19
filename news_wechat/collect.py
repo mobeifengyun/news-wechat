@@ -21,7 +21,7 @@
 
 约束（与本地流程完全一致）:
   - 来源必须是 config.json 的 source_whitelist 白名单
-  - 每条摘要 40-60 字（含标点）
+  - 每条摘要 40-55 字（含标点；validate 仍按 28-60 留缓冲）
   - 5 个板块各 3-6 条
   - hotspot 6-12 条，site 在 hotlist_sites
   - interaction 仅 1 个 card，且卡型与上一期不同
@@ -619,8 +619,10 @@ def _strip_inline_markup(line):
     # 来源/编辑/记者等前缀（去掉“来源：”后紧跟的媒体名也一并去掉）
     line = _re.sub(r"^(?:来源|编辑|记者|作者|审核|校对|发布时间|更新时间|阅读|浏览量)[:：]\s*", "", line)
     # 去掉摄影/记者署名行："活动现场 澎湃新闻记者 邓玲玮 摄"、"XXX 记者 XXX 摄"、"记者 XXX 摄影"
-    line = _re.sub(r"(?:^|\s)\S*?记者\s+\S+\s*(?:摄|摄影|图)(?:\s|$)", " ", line)
-    line = _re.sub(r"(?:^|\s)\S+\s+摄(?:\s|$)", " ", line)
+    # 注意：中文正文里 摄/图 后常紧跟标点（。，；等）而非空白，因此结尾允许标点
+    _tail = r"(?:\s|[\u3002\uff0c\uff0e\uff1b\uff01\uff1f\u3001]|$)"
+    line = _re.sub(r"(?:^|\s)\S*?记者\s+\S+\s*(?:摄|摄影|图)" + _tail, " ", line)
+    line = _re.sub(r"(?:^|\s)\S+\s+摄" + _tail, " ", line)
     # 如果行首残留常见媒体名 + 数字/空格/UI 控件，也清理掉
     for name in MEDIA_NAMES:
         line = _re.sub(r"^" + _re.escape(name) + r"\s*\d*\s*", "", line)
@@ -991,6 +993,76 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
     return data
 
 
+# ---------------- AI 成稿硬性净化（兜底，防 LLM 误抄脏内容） ----------------
+
+def _sanitize_ai_text(text, max_len=58, min_len=28):
+    """对 LLM 生成的单条 text 做硬性净化：
+    - 去除广告话术 / 摄影署名 / 空括号 / UI 残留（复用 _strip_inline_markup）
+    - 兜底剥离从 Tavily 碎片误抄的「下载…APP」「关注…公众号」等营销话术
+    - 补全句末标点（AI 偶尔漏标）
+    - 超长按完整句截断兜底
+    不重写语义，只去脏 + 控字数，保证 AI 成稿也达标。"""
+    import re as _re
+    if not text or not isinstance(text, str):
+        return text
+    t = _strip_inline_markup(text.strip())
+    # 去空括号（英文/数字删除残留）：() （） [] 【】
+    t = _re.sub(r"[\(（\[【]\s*[\)）\]】]", "", t)
+    # 兜底广告/营销话术（AI 偶从 Tavily 碎片误抄，且 _strip_inline_markup 仅匹配「官方APP」会漏）：
+    # 下载…APP、关注…公众号、把握财富机会、洞察政策信息、扫描…二维码、点击领取/下载、注册即送
+    ad_re = [
+        r"下载[^，。！？；]{0,20}?APP",
+        r"关注[^，。！？；]{0,20}?公众号[^，。！？；]{0,12}",
+        r"把握财富机会",
+        r"洞察政策信息",
+        r"扫描[^，。！？；]{0,20}?二维码",
+        r"点击[^，。！？；]{0,20}?(?:领取|下载|关注|报名|进入|了解|查看|阅读|更多)",
+        r"注册即送[^，。！？；]{0,20}",
+        r"看更多", "了解更多", "阅读全文", "查看更多", "详情点击", "点击进入",
+        r"原标题[:：][^，。！？；]{0,30}",
+        r"责任编辑[:：][^，。！？；]{0,20}",
+        r"责编[:：][^，。！？；]{0,20}",
+        r"扫码[^，。！？；]{0,20}?(?:加微信|关注|领取)?",
+        r"加微信[^，。！？；]{0,20}",
+        r"微信号[:：]?[^\s，。！？；]{0,20}",
+        r"后台回复[^，。！？；]{0,20}",
+        r"全文完", "（图）", "（图文）", "图源[:：][^，。！？；]{0,20}",
+        r"资料图[^，。！？；]{0,10}", "视觉中国", r"IC\s*photo",
+        r"转载请[^，。！？；]{0,20}", "版权声明", "免责声明",
+        r"点击[^，。！？；]{0,10}?领取",
+    ]
+    for p in ad_re:
+        t = _re.sub(p, "", t, flags=_re.I)
+    t = t.strip(" ，。、；")
+    t = t.strip()
+    if not t:
+        return t
+    # 半截句：无句末标点则补句号
+    if t[-1] not in "。！？；":
+        t += "。"
+    # 超长：优先按完整句截断，失败则硬截断补句号
+    if len(t) > max_len:
+        cut = _smart_truncate(t, max_len=max_len, min_len=min_len)
+        t = cut if cut else t[:max_len] + "。"
+    return t
+
+
+def _sanitize_ai_candidate(cand, cfg):
+    """对 LLM 返回的整份 JSON 做净化：逐条清洗 section/hotspot 文本，
+    保证即使 AI 误抄了 Tavily 碎片中的广告/署名/空括号，也能被兜掉。"""
+    if not isinstance(cand, dict):
+        return cand
+    for sec in cand.get("sections", []) or []:
+        for it in sec.get("items", []) or []:
+            if isinstance(it, dict) and it.get("text"):
+                it["text"] = _sanitize_ai_text(it["text"])
+    hs = cand.get("hotspot") or {}
+    for it in hs.get("items", []) or []:
+        if isinstance(it, dict) and it.get("text"):
+            it["text"] = _sanitize_ai_text(it["text"], max_len=30, min_len=8)
+    return cand
+
+
 def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     d = date.fromisoformat(day)
     theme = festival_of(d)
@@ -1004,7 +1076,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "生成每日早报的结构化数据。必须遵守以下铁律：\n"
         "1. 所有新闻事实只能引用白名单媒体，绝不使用白名单以外的任何来源"
         "（含境外媒体、自媒体、营销号）。白名单：" + wl + "。\n"
-        "2. 每条新闻摘要严格 35–55 个汉字（含标点），用客观陈述句，不评论、不引申；宁可稍详勿过简。"
+        "2. 每条新闻摘要严格 40–55 个汉字（含标点），用客观陈述句，不评论、不引申；宁可稍详勿过简。"
         "组稿须按「早间新闻晨读（如央视《朝闻天下》式）」思路覆盖当天要闻：国内、国际、财经、科技、民生、文体各大类都要有代表，"
         "重大事件宁多勿漏，不要只盯着一两个话题。\n"
         "3. 来源 source 必须是白名单中的某个媒体名，且确实报道过该事。\n"
@@ -1028,9 +1100,13 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "最终每一条新闻的事实仍须来自上面的白名单媒体检索结果，"
         "source 必须是白名单媒体名，绝不可把公众号或其素材当作信源、"
         "绝不可照搬其原文原句。"
+        "10. 联网检索素材常夹带网页噪声：下载APP/关注公众号等广告话术、"
+        "「记者 XXX 摄」等摄影署名、以及「兆易创新()」这类因删英文/数字残留的空括号。"
+        "成稿时必须彻底剔除这些噪声，用自己的话重写干净摘要，不得原样照搬上述噪声。"
+        "11. 时效性等其余铁律见下一条补充指令。"
     )
     sys_prompt += (
-        f"\n10. 时效性铁律（最高优先级）：所有新闻必须是「{day}」当天（或前一日 24–48 小时内）"
+        f"\n11. 时效性铁律（最高优先级）：所有新闻必须是「{day}」当天（或前一日 24–48 小时内）"
         f"由白名单媒体新近发布/滚动报道的事件，报道日期不得早于 {day} 超过 2 天。"
         f"严禁采用周年纪念、历史回顾、旧闻重发、科普百科、以及在 {day} 之前就已发生且已被广泛报道过的「旧热点」。"
         f"若联网检索只得到旧闻、或某条结果无法确认其报道日期在 {day} 前后，宁可该板块少写几条，"
@@ -1083,7 +1159,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         '  "greeting": "一句早安问候（≤20字）",\n'
         '  "quote": "原创/公版励志微语（≤30字）",\n'
         '  "sections": [\n'
-        '    {"name": "国内要闻", "items": [{"text": "40-60字摘要", "source": "央视新闻"}]},\n'
+        '    {"name": "国内要闻", "items": [{"text": "40-55字摘要", "source": "央视新闻"}]},\n'
         '    {"name": "国际新闻", "items": [...]},\n'
         '    {"name": "财经动态", "items": [...]},\n'
         '    {"name": "科技前沿", "items": [...]},\n'
@@ -1191,6 +1267,8 @@ def _generate_with_provider(prov, day, cfg, prev_type, search_ctx, seed, tools):
                 if m:
                     raw = m.group(0)
                 cand = json.loads(raw)
+                # AI 成稿硬性净化：兜底去除误抄的广告/摄影署名/空括号/UI 残留，补句末标点
+                cand = _sanitize_ai_candidate(cand, cfg)
             except Exception as e:
                 if isinstance(e, LLMAuthError):
                     # 鉴权/额度类：该供应商整体不可用，跳出模型循环
@@ -1342,7 +1420,10 @@ def main():
     if not use_tavily and not use_kimi and not tools:
         msg = (
             "ERROR: 未配置任何真实联网检索（TAVILY_API_KEY 未设且非 Kimi/Google 搜索模式），"
-            "为避免编造虚假新闻，已拒绝生成。请在 GitHub Secrets 配置 TAVILY_API_KEY 并将 SEARCH_MODE 设为 tavily。"
+            "为避免编造虚假新闻，已拒绝生成。\n"
+            "→ 主模型若为 OpenRouter / DeepSeek 等「无内置搜索」供应商，必须配置 TAVILY_API_KEY"
+            "（建议同时把 SEARCH_MODE 设为 tavily），否则云端必定硬熔断、当天不出报。\n"
+            "→ 若用 Kimi/Moonshot，请将 SEARCH_MODE 设为 kimi；若用 Gemini，请确认 LLM_BASE_URL 指向 googleapis.com。"
         )
         print(msg, flush=True)
         try:
