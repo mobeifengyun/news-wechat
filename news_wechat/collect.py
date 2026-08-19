@@ -328,9 +328,9 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # OpenRouter 推荐提供这两个 header，其它平台无影响
+        # OpenRouter 推荐提供这两个 header；HTTP 头必须用 ASCII，不能含中文
         "HTTP-Referer": "https://github.com/mobeifengyun/news-wechat",
-        "X-Title": "报简说日报",
+        "X-Title": "news-wechat-daily",
     }
     try:
         r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
@@ -1124,7 +1124,7 @@ def _default_model_for(base_url):
     if "moonshot" in base_url:
         return "kimi-k2.6"
     if "openrouter" in base_url:
-        return "deepseek/deepseek-chat-v3.1:free"
+        return "deepseek/deepseek-chat:free"
     if "siliconflow" in base_url or "silicon" in base_url:
         return "deepseek-ai/DeepSeek-V3"
     if "dashscope" in base_url:
@@ -1156,8 +1156,8 @@ def _resolve_provider(n=""):
     fallbacks = []
     if "openrouter" in base_url:
         fb = [
-            "qwen/qwen3-8b:free",
-            "meta-llama/llama-3.1-8b-instruct:free",
+            "qwen/qwen-2.5-72b-instruct:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
             "google/gemma-2-9b-it:free",
         ]
         fallbacks = [m for m in fb if m != main_model]
