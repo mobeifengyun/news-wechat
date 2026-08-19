@@ -319,13 +319,18 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
         ],
     }
     # DeepSeek reasoner / 思考类模型通常不支持 response_format，避免 400
-    if not any(k in model.lower() for k in ("reasoner", "-think", "thinking", "r1")):
+    # OpenRouter 免费层(:free) 对 json_object 支持不稳定，也跳过，靠 prompt+正则提取 JSON
+    is_openrouter = "openrouter" in base_url.lower()
+    if not any(k in model.lower() for k in ("reasoner", "-think", "thinking", "r1")) and not is_openrouter:
         body["response_format"] = {"type": "json_object"}
     if tools:
         body["tools"] = tools
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        # OpenRouter 推荐提供这两个 header，其它平台无影响
+        "HTTP-Referer": "https://github.com/mobeifengyun/news-wechat",
+        "X-Title": "报简说日报",
     }
     try:
         r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
@@ -1110,6 +1115,112 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     return sys_prompt, user_prompt
 
 
+# ---------- 多供应商替补链（主 → 同平台备用模型 → 跨平台备援 → 规则拼装） ----------
+
+def _default_model_for(base_url):
+    """按 base_url 推断默认模型，覆盖常见 OpenAI 兼容平台。"""
+    if "deepseek.com" in base_url:
+        return "deepseek-chat"
+    if "moonshot" in base_url:
+        return "kimi-k2.6"
+    if "openrouter" in base_url:
+        return "deepseek/deepseek-chat-v3.1:free"
+    if "siliconflow" in base_url or "silicon" in base_url:
+        return "deepseek-ai/DeepSeek-V3"
+    if "dashscope" in base_url:
+        return "qwen-plus"
+    if "bigmodel" in base_url or "zhipu" in base_url:
+        return "glm-4-air"
+    return DEFAULT_MODEL
+
+
+def _resolve_provider(n=""):
+    """从环境变量读取一个 LLM 供应商配置。
+    n 为空=主供应商（LLM_API_KEY/LLM_BASE_URL/LLM_MODEL）；
+    n='2'/'3'=跨平台备援供应商（LLM2_API_KEY/LLM2_BASE_URL/LLM2_MODEL 等）。
+    未配置 key 时返回 None。
+    返回: {"base_url","api_key","models","is_kimi"}
+      - models 为待尝试模型列表（主模型 + 同平台免费备援模型）
+    """
+    api_key = (os.environ.get(f"LLM{n}_API_KEY", "") or "").strip()
+    if not api_key:
+        return None
+    base_url_env = (os.environ.get(f"LLM{n}_BASE_URL", "") or "").strip()
+    if not base_url_env:
+        base_url_env = DEFAULT_BASE
+    base_url = _normalize_llm_url(base_url_env, "")
+    is_kimi = "moonshot" in base_url
+    main_model = (os.environ.get(f"LLM{n}_MODEL", "") or "").strip() or _default_model_for(base_url)
+
+    # 同平台免费备援模型：主模型失败（额度/限流/下架）时自动换一个试试
+    fallbacks = []
+    if "openrouter" in base_url:
+        fb = [
+            "qwen/qwen3-8b:free",
+            "meta-llama/llama-3.1-8b-instruct:free",
+            "google/gemma-2-9b-it:free",
+        ]
+        fallbacks = [m for m in fb if m != main_model]
+    models = [main_model] + fallbacks
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "models": models,
+        "is_kimi": is_kimi,
+    }
+
+
+def _generate_with_provider(prov, day, cfg, prev_type, search_ctx, seed, tools):
+    """对单个供应商尝试成稿：先跑主模型，失败再换同平台备用模型，仍失败返回 None。
+    返回 (data, last_err, last_raw)。"""
+    last_err = ""
+    last_raw = ""
+    for model in prov["models"]:
+        # 每个模型最多 3 次重试
+        errors = []
+        for attempt in range(3):
+            sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
+            print(f"    模型 {model} 第 {attempt+1}/3 次生成…", flush=True)
+            try:
+                if prov["is_kimi"]:
+                    raw = kimi_chat(sys_p, usr_p, prov["base_url"], prov["api_key"], model)
+                else:
+                    raw = llm_chat(sys_p, usr_p, prov["base_url"], prov["api_key"], model, tools)
+                last_raw = raw
+                m = re.search(r"\{.*\}", raw, re.S)
+                if m:
+                    raw = m.group(0)
+                cand = json.loads(raw)
+            except Exception as e:
+                if isinstance(e, LLMAuthError):
+                    # 鉴权/额度类：该供应商整体不可用，跳出模型循环
+                    last_err = str(e)
+                    print(f"    ⚠️ {model} 鉴权/额度失败：{str(e)[:160]}", flush=True)
+                    return None, last_err, last_raw
+                last_err = str(e)
+                print("    解析失败:", e, flush=True)
+                errors = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
+                continue
+            errors = validate(cand, cfg)
+            if errors:
+                print("    校验未过：", errors[0], flush=True)
+                continue
+            fresh = check_freshness(cand, day)
+            if fresh:
+                print("    时效性校验未过：", fresh, flush=True)
+                errors = [f"时效性校验未过：{fresh}"]
+                last_err = errors[-1]
+                continue
+            if audit_block(cand, day) > 0:
+                errors = ["内容触发合规 BLOCK，请改用更中性的表述后重试"]
+                print("    合规 BLOCK，重试", flush=True)
+                continue
+            return cand, "", last_raw
+        # 当前模型 3 次都失败，log 后换下一个同平台模型
+        print(f"    ⚠️ 模型 {model} 3 次未成稿（{last_err[:120]}），尝试同平台备用模型…", flush=True)
+    return None, last_err, last_raw
+
+
 def main():
     tz = timezone(timedelta(hours=8))
     day = sys.argv[1] if len(sys.argv) > 1 else datetime.now(tz).strftime("%Y-%m-%d")
@@ -1136,25 +1247,26 @@ def main():
     tavily_key = os.environ.get("TAVILY_API_KEY", "")
     search_mode = os.environ.get("SEARCH_MODE", "auto").lower()
 
-    # 智能默认：若用户配置了 LLM_API_KEY 但没给 LLM_BASE_URL，优先 DeepSeek（国内可达）
-    default_base = DEFAULT_BASE
-    if api_key and not os.environ.get("LLM_BASE_URL"):
-        default_base = "https://api.deepseek.com/v1"
-    base_url_env = os.environ.get("LLM_BASE_URL", default_base).strip()
-    if not base_url_env:
-        base_url_env = default_base
-    base_url = base_url_env.rstrip("/") + "/"
-    # 默认模型也跟随 base_url
-    default_model = DEFAULT_MODEL
-    if "deepseek" in base_url:
-        default_model = "deepseek-chat"
-    elif "moonshot" in base_url:
-        default_model = "kimi-k2.6"
-    model = os.environ.get("LLM_MODEL", default_model)
+    # 构建供应商替补链：主供应商(LLM_*) → 同平台备用免费模型 →
+    # 跨平台备援(LLM2_* / LLM3_：硅基流动/阿里百炼/智谱…)。
+    # 任一供应商出错自动切下一个；主供应商未配则链为空，直接走规则拼装保底。
+    providers = []
+    _p1 = _resolve_provider("")
+    if _p1:
+        providers.append(_p1)
+    for _n in ("2", "3"):
+        _p = _resolve_provider(_n)
+        if _p:
+            providers.append(_p)
+    primary = providers[0] if providers else None
+    api_key = primary["api_key"] if primary else ""
+    base_url = primary["base_url"] if primary else DEFAULT_BASE
+    model = primary["models"][0] if primary else DEFAULT_MODEL
+    is_kimi_primary = primary["is_kimi"] if primary else False
 
     use_tavily = (search_mode == "tavily") or (tavily_key and search_mode != "none")
     use_kimi = (search_mode == "kimi") or (
-        "moonshot" in base_url and not use_tavily and search_mode != "none"
+        is_kimi_primary and not use_tavily and search_mode != "none"
     )
     if not use_tavily and not api_key:
         print("ERROR: 未设置 LLM_API_KEY，且未启用 Tavily 检索，无法在云端采集。")
@@ -1167,8 +1279,9 @@ def main():
     seed = load_seed(day)
     if seed:
         print(f"检测到公众号参考素材：{len(seed)} 字（仅作选题启发，事实仍以白名单为准）", flush=True)
-    safe_base = base_url.replace(api_key, "***") if api_key else base_url
-    print(f"采集 {day}（上期卡型={prev_type or '无'}）模型={model} base={safe_base}")
+    nprov = len(providers)
+    print(f"采集 {day}（上期卡型={prev_type or '无'}）供应商链={nprov}个"
+          + (f"，主模型={model}" if primary else "，无 LLM，直接走规则拼装"))
 
     search_ctx = []
     sec_ctx_map = {}  # Tavily 按板块归属的检索结果（降级拼装用）
@@ -1243,58 +1356,27 @@ def main():
     data = None
     last_err = ""
     last_raw = ""
-    # 未配置任何成稿模型（无 DeepSeek/Kimi key）→ 跳过 LLM，直接走 Tavily 规则拼装保底
-    no_llm = (not api_key or api_key.strip() == "") and not use_kimi
+    # 未配置任何成稿模型（供应商链为空且非 Kimi 模式）→ 跳过 LLM，直接走规则拼装保底
+    no_llm = (len(providers) == 0) and not use_kimi
     if no_llm:
-        print("未配置成稿模型 key，直接走 Tavily 规则拼装保底…", flush=True)
-    for attempt in range(3):
-        if no_llm:
-            break
-
-        sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
-        print(f"第 {attempt+1}/3 次生成…", flush=True)
-        try:
-            if use_kimi:
-                raw = kimi_chat(sys_p, usr_p, base_url, api_key, model)
-            else:
-                raw = llm_chat(sys_p, usr_p, base_url, api_key, model, tools)
-            last_raw = raw
-            # 容错：去掉可能包裹的 ```json ``` 标记
-            m = re.search(r"\{.*\}", raw, re.S)
-            if m:
-                raw = m.group(0)
-            cand = json.loads(raw)
-        except Exception as e:
-            if isinstance(e, LLMAuthError):
-                # 鉴权/额度失败：跳过剩余重试，直接走规则拼装保底
-                last_err = str(e)
+        print("未配置任何成稿模型 key，直接走 Tavily 规则拼装保底…", flush=True)
+    else:
+        for pi, prov in enumerate(providers, 1):
+            tag = "主供应商" if pi == 1 else f"备援供应商{pi-1}"
+            print(f"▶ 尝试 {tag}：{prov['models'][0]} @ {prov['base_url']}", flush=True)
+            cand, err, raw = _generate_with_provider(prov, day, cfg, prev_type, search_ctx, seed, tools)
+            if cand:
+                data = cand
+                print(f"✅ {tag} 成稿成功", flush=True)
                 break
-            last_err = str(e)
-            print("  解析失败:", e, flush=True)
-            errors = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
-            continue
-
-        errors = validate(cand, cfg)
-        if errors:
-            print("  校验未过：", errors[0], flush=True)
-            continue
-        fresh = check_freshness(cand, day)
-        if fresh:
-            print("  时效性校验未过：", fresh, flush=True)
-            errors = [f"时效性校验未过：{fresh}"]
-            last_err = errors[-1]
-            continue
-        if audit_block(cand, day) > 0:
-            errors = ["内容触发合规 BLOCK，请改用更中性的表述后重试"]
-            print("  合规 BLOCK，重试", flush=True)
-            continue
-        data = cand
-        break
+            last_err = err
+            last_raw = raw
+            print(f"⚠️ {tag} 失败（{(err or '多次重试未成稿')[:140]}），自动切换下一个供应商…", flush=True)
 
     if not data:
-        # LLM 成稿失败 → 降级为 Tavily 规则拼装（无模型依赖，保证当天出稿、绝不编造）
+        # 所有供应商（主+备援+同平台模型）均失败 → 降级为 Tavily 规则拼装（无模型依赖，保证当天出稿、绝不编造）
         if use_tavily and sec_ctx_map:
-            print("⚠️ LLM 成稿失败，降级为 Tavily 规则拼装保底…", flush=True)
+            print("⚠️ 所有 LLM 供应商均失败，降级为 Tavily 规则拼装保底…", flush=True)
             ruled = rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type)
             if ruled:
                 data = ruled
@@ -1311,7 +1393,7 @@ def main():
                 print("已写诊断到", err_path, flush=True)
             except Exception:
                 pass
-            print("ERROR: 3 次尝试仍未生成合规内容且降级失败：", errors, flush=True)
+            print("ERROR: 所有 LLM 供应商及规则拼装均已失败，未生成合规内容：", errors, flush=True)
             sys.exit(1)
 
     # 农历由代码计算，避免模型误差
