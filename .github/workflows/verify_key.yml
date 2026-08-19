@@ -1,6 +1,7 @@
-name: 密钥自检（Kimi / ServerChan）
+name: 密钥自检（LLM / Tavily / ServerChan）
 
-# 用途：随时手动点一下，10 秒内确认 GitHub Secrets 里的密钥还有没有效。
+# 用途：随时手动点一下，确认 GitHub Secrets 里的密钥还有没有效。
+# 覆盖：大模型密钥（LLM_API_KEY/LLM_BASE_URL/LLM_MODEL）、Tavily 检索密钥、ServerChan（可选）。
 # 只发一次极简请求，不采集、不生成、不推送真实内容，绝不干扰当日期次。
 # 场景：换了 Kimi Key 想立刻确认；或某天没收到推送，先来这里排查是不是密钥过期。
 
@@ -81,6 +82,36 @@ jobs:
           elif r.status_code == 429:
               print('→ 429 = 限流或余额不足，去平台后台看用量与账户余额。')
           sys.exit(1)
+          PY
+
+      - name: 检测 Tavily 检索密钥（OpenRouter/DeepSeek 方案必需）
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, sys, requests
+          key = os.environ.get('TAVILY_API_KEY', '').strip()
+          if not key:
+              print('ℹ️ TAVILY_API_KEY 为空。若主模型用 OpenRouter/DeepSeek 等无内置搜索供应商，'
+                    '云端会因「空检索硬熔断」直接不出报；此时必须配置 Tavily（建议 SEARCH_MODE=tavily）。')
+              sys.exit(0)
+          try:
+              r = requests.post(
+                  'https://api.tavily.com/search',
+                  json={'api_key': key, 'query': '今日新闻 新华社', 'max_results': 1, 'topic': 'news', 'days': 1},
+                  timeout=30,
+              )
+              print('HTTP', r.status_code, r.text[:240])
+              if r.status_code == 200:
+                  print('✅ Tavily 密钥有效，可正常检索白名单域名近 2 日新闻。')
+                  sys.exit(0)
+              print('❌ Tavily 返回非 200，检查密钥或额度。')
+              sys.exit(0)
+          except Exception as e:
+              print('⚠️ Tavily 请求失败（网络/密钥）：', e)
+              sys.exit(0)
           PY
 
       - name: 检测 ServerChan（可选，会真发一条微信）
