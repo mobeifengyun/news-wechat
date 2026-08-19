@@ -313,8 +313,10 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "response_format": {"type": "json_object"},
     }
+    # DeepSeek reasoner / 思考类模型通常不支持 response_format，避免 400
+    if not any(k in model.lower() for k in ("reasoner", "-think", "thinking", "r1")):
+        body["response_format"] = {"type": "json_object"}
     if tools:
         body["tools"] = tools
     headers = {
@@ -328,7 +330,13 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
         safe = url.replace(api_key, "***") if api_key else url
         print(f"  LLM 请求失败: {e.response.status_code} {safe}", flush=True)
         raise
-    return r.json()["choices"][0]["message"]["content"]
+    resp = r.json()
+    # 增强诊断：若返回的不是标准 OpenAI 格式，打印原始响应帮助排查 key/余额/模型错误
+    if "choices" not in resp:
+        raw_preview = json.dumps(resp, ensure_ascii=False)[:800]
+        print(f"  LLM 返回无 choices 字段（状态 {r.status_code}）：{raw_preview}", flush=True)
+        raise KeyError(f"choices (response keys: {list(resp.keys())})")
+    return resp["choices"][0]["message"]["content"]
 
 
 # ---------------- Kimi / Moonshot 联网搜索 ----------------
@@ -596,11 +604,16 @@ def _strip_inline_markup(line):
     line = _re.sub(r"[（(]\s*详情见.*?原文\s*[）)]", "", line, flags=_re.I)
     # 来源/编辑/记者等前缀（去掉“来源：”后紧跟的媒体名也一并去掉）
     line = _re.sub(r"^(?:来源|编辑|记者|作者|审核|校对|发布时间|更新时间|阅读|浏览量)[:：]\s*", "", line)
+    # 去掉摄影/记者署名行："活动现场 澎湃新闻记者 邓玲玮 摄"、"XXX 记者 XXX 摄"、"记者 XXX 摄影"
+    line = _re.sub(r"(?:^|\s)\S*?记者\s+\S+\s*(?:摄|摄影|图)(?:\s|$)", " ", line)
+    line = _re.sub(r"(?:^|\s)\S+\s+摄(?:\s|$)", " ", line)
     # 如果行首残留常见媒体名 + 数字/空格/UI 控件，也清理掉
     for name in MEDIA_NAMES:
         line = _re.sub(r"^" + _re.escape(name) + r"\s*\d*\s*", "", line)
     # 处理“澎湃 Logo/登录/#”这类行首媒体名+UI 控件的残留
     line = _re.sub(r"^(?:澎湃|界面|一财|新华|央视|人民|光明|经济|科技|环球)\s*(?:Logo|登录|#|>>)\s*", "", line, flags=_re.I)
+    # 去掉“活动现场”这类无意义场景前缀
+    line = _re.sub(r"^活动现场\s+", "", line)
     # 导航/UI 词（截图中实际出现）。注意：用一次性正则避免“已订阅”被拆成“已”。
     line = _re.sub(r"\d*_?\s*(?:订阅|收藏)|已订阅|已收藏|分享|评论|点赞|转发|登录|注册", "", line, flags=_re.I)
     ui_words = [
@@ -613,10 +626,30 @@ def _strip_inline_markup(line):
         line = _re.sub(_re.escape(w), "", line, flags=_re.I)
     # >> 路径：首页 >> 正文、财经 >> 正文 等
     line = _re.sub(r"(?:首页|频道|栏目|正文)\s*>>\s*[^\s，。！？；]*", "", line)
+    # 广告/营销话术（截图中出现过的）
+    ad_patterns = [
+        r"下载[“\"']?.*?官方?APP[“\"']?.*?(?:，|。|！|？|$)",
+        r"关注[“\"']?.*?官方?微信公众?号[“\"']?.*?(?:，|。|！|？|$)",
+        r"(?:随时|及时)了解.*?动态.*?(?:，|。|！|？|$)",
+        r"洞察政策信息.*?(?:，|。|！|？|$)",
+        r"把握财富机会.*?(?:，|。|！|？|$)",
+        r"即可.*?了解.*?把握.*?机会.*?(?:，|。|！|？|$)",
+        r"打开.*?APP.*?(?:，|。|！|？|$)",
+        r"扫描.*?二维码.*?(?:，|。|！|？|$)",
+        r"点击.*?(?:领取|下载|关注|报名).*(?:，|。|！|？|$)",
+        r"注册即送.*?(?:，|。|！|？|$)",
+    ]
+    for p in ad_patterns:
+        line = _re.sub(p, "", line, flags=_re.I)
     # 孤立英文（前后都不是英文/数字/中文的纯英文单词）
     line = _re.sub(r"(?<![A-Za-z0-9\u4e00-\u9fa5])[A-Za-z]{1,20}(?![A-Za-z0-9\u4e00-\u9fa5])", "", line)
     # 孤立数字：只删真正孤立的纯数字，保留“7月10日”“100%股权”等带单位的
     line = _re.sub(r"(?<![A-Za-z0-9\u4e00-\u9fa5%‰℃￥$€£])\d{1,20}(?![A-Za-z0-9\u4e00-\u9fa5%‰℃￥$€£])", "", line)
+    # 去掉英文/数字被删后留下的空括号（中英文）
+    line = _re.sub(r"\(\s*\)", "", line)
+    line = _re.sub(r"（\s*）", "", line)
+    line = _re.sub(r"\[\s*\]", "", line)
+    line = _re.sub(r"【\s*】", "", line)
     # 归一化空白
     line = _re.sub(r"\s+", " ", line).strip()
     return line
@@ -712,16 +745,21 @@ def _is_good_sentence(s):
         return False
     # 不以禁用词开头
     bad_starts = ["记者", "编辑", "来源", "免责声明", "版权声明", "相关新闻", "订阅",
-                  "导航", "首页", "滚动新闻", "图集", "第", "打开", "查看", "点击", "登录", "注册"]
+                  "导航", "首页", "滚动新闻", "图集", "第", "打开", "查看", "点击", "登录", "注册",
+                  "据报道", "据悉", "据了解", "据介绍", "消息称", "活动现场"]
     if any(s.startswith(w) for w in bad_starts):
         return False
     # 不包含禁用词/符号
     bad_inside = ["Image", "Logo", "订阅", "收藏", "全部导航", "https", "mailto",
                   "javascript", "复制地址", "QQ空间", "####", "详情见", "点击播报",
-                  "小字号", "【大 中 小】", "【大中小】", ">>", "来源:", "编辑:", "记者:"]
+                  "小字号", "【大 中 小】", "【大中小】", ">>", "来源:", "编辑:", "记者:",
+                  "下载", "官方APP", "微信公众号", "把握财富机会", "洞察政策信息"]
     if any(w in s for w in bad_inside):
         return False
-    # 必须以中文或数字开头
+    # 不包含只剩空括号
+    if _re.search(r"[（(]\s*[）)]", s):
+        return False
+    # 必须以中文开头
     if not _re.match(r"[\u4e00-\u9fa5]", s):
         return False
     return True
@@ -729,18 +767,18 @@ def _is_good_sentence(s):
 
 def _clean_first_sentence(text):
     """从正文中提取第一句（或前几句合并）完整、通顺、不含垃圾的陈述句。
-    只接受以 。！？ 结尾的完整句，拒绝半截句；若首句过短则尝试与下句合并。"""
+    接受以 。！？； 结尾的完整句，拒绝半截句；若首句过短则尝试与下句合并。"""
     import re as _re
     text = _clean_text(text)
     if not text:
         return ""
     text = text.strip('"').strip("'")
     # 按完整句末标点分割，保留标点
-    parts = _re.split(r"([。！？])", text)
+    parts = _re.split(r"([。！？；])", text)
     sentences = []
     current = ""
     for part in parts:
-        if part in "。！？":
+        if part in "。！？；":
             sentence = current.strip()
             if _is_good_sentence(sentence):
                 sentences.append(sentence + part)
@@ -761,20 +799,30 @@ def _clean_first_sentence(text):
 
 
 def _smart_truncate(text, max_len=60, min_len=12):
-    """智能截断：优先保留完整句子，其次保留完整分句，拒绝产生半截词。"""
+    """智能截断：只在完整句末（。！？；）截断，绝不在逗号处砍出半截句。
+    若找不到完整句末，宁可取更短的第一个完整句，也不要半截词。"""
+    import re as _re
     text = text.strip()
     if len(text) <= max_len:
         return text if len(text) >= min_len else ""
+    # 1) 在 max_len 内找最后一个完整句末
     cut = text[:max_len]
-    # 1) 完整句末
     idx = max(cut.rfind("。"), cut.rfind("！"), cut.rfind("？"), cut.rfind("；"))
     if idx >= min_len - 5:
         return text[:idx + 1]
-    # 2) 完整分句（逗号）
-    idx = cut.rfind("，")
-    if idx >= min_len - 5:
-        return text[:idx + 1]
-    # 3) 否则视为无法截出完整语义，拒绝
+    # 2) 没有的话，取 text 中第一个满足条件的完整句（可能较短，但语义完整）
+    parts = _re.split(r"([。！？；])", text)
+    current = ""
+    for part in parts:
+        if part in "。！？；":
+            sentence = current.strip()
+            full = sentence + part
+            if _is_good_sentence(sentence) and min_len <= len(full) <= max_len:
+                return full
+            current = ""
+        else:
+            current += part
+    # 3) 实在没有完整句，拒绝
     return ""
 
 
@@ -820,12 +868,18 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             body = _clean_first_sentence(content)
             if len(body) < 12:
                 body = _clean_text(title)
-                # 标题兜底：要求 ≥20 字、不以媒体名开头、不含导航/UI 词、语义完整
-                looks_complete = body.endswith(("。", "！", "？")) or len(body) >= 28
+                # 标题兜底：要求 ≥20 字、不以媒体名开头、不以废话开头、不含导航/UI 词
+                bad_title_starts = ["据报道", "据悉", "据了解", "据介绍", "消息称"]
                 if (len(body) < 20 or
-                    not looks_complete or
                     any(body.startswith(m) for m in MEDIA_NAMES) or
+                    any(body.startswith(m) for m in bad_title_starts) or
                     _re.search(r"Image|Logo|订阅|收藏|全部导航|https|mailto|javascript|复制地址|QQ空间|####|详情见|点击播报|小字号|>>", body, _re.I)):
+                    continue
+                # 无句末标点的干净标题，去掉末尾逗号/分号/冒号后补句号
+                if body and body[-1] not in "。！？；":
+                    body = body.rstrip("，,；;:：") + "。"
+                # 补完句号后仍是以废话词结尾的，不要
+                if body.endswith(("据报道。", "据悉。", "据了解。", "据介绍。", "消息称。")):
                     continue
             if len(body) < 12:
                 continue
@@ -838,9 +892,10 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             text = _smart_truncate(text, max_len=60, min_len=12)
             if not text:
                 continue
-            # 最终过滤：来源合规、无垃圾、字数合规
+            # 最终过滤：来源合规、无垃圾、字数合规、必须以完整句末结尾
             cn_chars = len(_re.findall(r"[\u4e00-\u9fa5]", text))
             if (cn_chars < 10 or
+                text[-1] not in "。！？；" or
                 _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|Logo|订阅|收藏|全部导航|复制地址|QQ空间|####|详情见", text, _re.I) or
                 _re.search(r"^(第\d+页|要闻|首页|订阅|导航|滚动新闻|202\d年\d+月\d+日)", text)):
                 continue
@@ -860,9 +915,15 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
         if len(t) < 12:
             t = _clean_text(title)
             # 标题兜底同样过滤
+            bad_title_starts = ["据报道", "据悉", "据了解", "据介绍", "消息称"]
             if (len(t) < 20 or
                 any(t.startswith(m) for m in MEDIA_NAMES) or
+                any(t.startswith(m) for m in bad_title_starts) or
                 _re.search(r"Image|Logo|订阅|收藏|全部导航|https|mailto|javascript|复制地址|QQ空间|####|详情见|点击播报|小字号|>>", t, _re.I)):
+                continue
+            if t and t[-1] not in "。！？；":
+                t = t.rstrip("，,；;:：") + "。"
+            if t.endswith(("据报道。", "据悉。", "据了解。", "据介绍。", "消息称。")):
                 continue
         t = t.strip()
         # 热点要实质性中文句子；过滤 URL/markdown/图片/UI 垃圾/无意义片段
@@ -871,9 +932,9 @@ def rule_assemble(sec_ctx_map, hot_ctx, day, cfg, prev_type):
             continue
         if _re.search(r"https?|mailto|javascript|!\[|\[\]|Image|Logo|订阅|收藏|全部导航|复制地址|QQ空间|####|详情见", t, _re.I):
             continue
-        # 截断到 30 字以内，只在完整句/分句处截断，绝不在半截词处截断
+        # 截断到 30 字以内，只在完整句末截断，拒绝半截句
         t = _smart_truncate(t, max_len=30, min_len=12)
-        if not t:
+        if not t or t[-1] not in "。！？；":
             continue
         if t not in [x["text"] for x in data["hotspot"]["items"]]:
             data["hotspot"]["items"].append({"text": t, "site": hs0})
