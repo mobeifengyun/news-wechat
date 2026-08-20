@@ -364,6 +364,17 @@ _CUT_MARKERS = [
     "不构成投资建议", "投资有风险", "扫码", "加微信", "公众号", "关注我们",
     "把握财富机会", "看更多", "点击进入", "点击查看", "更多资讯",
     "来源：", "来源:", "编辑：", "编辑:", "首页>", "首页 >", "返回首页",
+    "相关进展受到媒体持续关注与报道", "相关议题持续受到舆论关注",
+]
+
+# 标题/正文中常见的尾部站点/平台/栏目名（来源由 URL 单独回填，这里只保留新闻标题本身）
+_NOISE_SUFFIXES = [
+    "智慧普法平台", "光明网", "每经网", "人民网", "新华网", "央视网", "中新网",
+    "中国网", "央广网", "中国日报网", "环球网", "参考消息网", "北青网",
+    "澎湃新闻", "新京报", "北京日报", "上观新闻", "南方plus", "上游新闻",
+    "钛媒体", "虎嗅", "雷锋网", "量子位", "36氪", "IT之家", "财联社",
+    "界面新闻", "21世纪经济报道", "每日经济新闻", "中国证券报", "经济观察报",
+    "科技日报", "证券时报", "第一财经", "上海证券报", "经济日报", "中国青年报",
 ]
 
 
@@ -372,22 +383,53 @@ def _clean_one(text):
     if not isinstance(text, str):
         return text
     t = text.strip()
-    # 去掉 markdown 行内标记（**、##、`、>、#）
+    # 去掉 markdown 行内标记（**、##、`、>、#、_）
     t = re.sub(r"[*_`#>]", "", t)
     # 从首个噪声标记处截断（保留其前的新闻正文，避免残留「：李明」之类）
     cuts = [i for i in (t.find(m) for m in _CUT_MARKERS) if i >= 0]
     if cuts:
         t = t[:min(cuts)]
+    # 去掉尾部来源标注如"（中国政府网）"、"（人民日报）"，来源由 URL 单独回填
+    for _ in range(3):
+        m = re.search(r"[（(]([^（）()]{1,20})[）)]\s*$", t)
+        if not m:
+            break
+        inner = m.group(1).strip()
+        if inner in WHITELIST or inner in _NOISE_SUFFIXES:
+            t = t[:m.start()].strip()
+        else:
+            break
+    # 去掉标题尾部常见站点/平台/栏目名（来源由 URL 单独回填）
+    for _ in range(3):  # 多轮剥离，防止 "A|B|C" 这类多层后缀
+        t = t.rstrip("，。；、,.;:-—–—-|｜_ ")
+        changed = False
+        for sfx in _NOISE_SUFFIXES:
+            for sep in ("", " ", "—", "--", "-", "_", "|", "｜"):
+                if t.endswith(sep + sfx):
+                    t = t[:-len(sep + sfx)]
+                    changed = True
+                    break
+            if changed:
+                break
+        if not changed:
+            break
+    # 去掉常见平台/栏目分隔后缀（"| 每经网"、"_光明网"、"--经济·科技--人民网" 等）
+    t = re.sub(r"\s*[|｜]\s*[^\s|｜]{2,20}$", "", t)
+    t = re.sub(r"[_][^\s_]{2,20}$", "", t)
+    t = re.sub(r"[-—]{2,}[^-—]{2,30}[-—]{2,}[^-—\s]{2,20}\s*[。．.]*$", "", t)
     # 摄影/记者署名（含全角括号包裹、句尾）
     t = re.sub(r"[（(]?\s*记者[\u4e00-\u9fff\s]{0,15}摄\s*[）)]?", "", t)
     t = re.sub(r"摄影[：:][\u4e00-\u9fff]{0,15}", "", t)
     t = re.sub(r"[\u4e00-\u9fff]{0,8}摄[。．.\s）)】]*$", "", t)
     # 空括号 （）()
     t = re.sub(r"[（(]\s*[）)]\s*", "", t)
+    # 合并重复标点
+    t = re.sub(r"[。．.]{2,}", "。", t)
+    t = re.sub(r"[，,]{2,}", "，", t)
     # 收尾：去首尾引号/空白、合并多空格、去尾随标点
-    t = t.strip().strip('"').strip()
+    t = t.strip().strip('"').strip("'").strip('"').strip()
     t = re.sub(r"\s{2,}", " ", t).strip()
-    t = t.rstrip("：:；;，,")
+    t = t.rstrip("：:；;，,—–-")
     # 超长保护：>120 字按句边界截断并补句号
     if len(t) > 120:
         cut = t[:120].rstrip("，、；,;")
@@ -633,6 +675,52 @@ for _n, _ds in WL_DOMAINS.items():
         _DOMAIN_TO_SOURCE.setdefault(_d, _n)
 
 
+def _normalize_base_url(base_url):
+    """修正常见 base_url 路径错误，避免 404。
+
+    用户常把 OpenRouter 配成 https://openrouter.ai/ 或 https://openrouter.ai/api/，
+    Moonshot 配成 https://api.moonshot.cn/，这里统一规范到正确的 OpenAI 兼容端点。
+    """
+    if not base_url:
+        return base_url
+    b = base_url.rstrip("/").lower()
+    if "openrouter.ai" in b:
+        return "https://openrouter.ai/api/v1/"
+    if "moonshot" in b or "api.moonshot.cn" in b:
+        return "https://api.moonshot.cn/v1/"
+    if "generativelanguage.googleapis.com" in b:
+        return "https://generativelanguage.googleapis.com/v1beta/openai/"
+    # 其他 OpenAI 兼容端点：若用户只写了域名，尝试补 /v1
+    if b.startswith("http") and "/v1" not in b and "/api/" not in b:
+        return base_url.rstrip("/") + "/v1/"
+    return base_url.rstrip("/") + "/"
+
+
+# 规则拼装兜底用：板块 -> 匹配关键词
+_SEC_KEYWORDS = {
+    "国内要闻": ["国内", "中国", "北京", "上海", "国务院", "发改委", "政策", "航天", "卫星", "火箭", "发射", "深中", "高铁", "地铁", "国内要闻", "台湾", "港澳"],
+    "国际新闻": ["国际", "美国", "俄罗斯", "乌克兰", "特朗普", "拜登", "欧盟", "日本", "韩国", "中东", "伊朗", "以色列", "外交", "外交部", "联合国", "北约", "朝鲜", "印度", "巴基斯坦", "阿富汗"],
+    "财经动态": ["财经", "股市", "a股", "沪指", "股价", "央行", "楼市", "房地产", "银行", "证券", "基金", "消费", "数据要素", "财报", "业绩", "涨跌", "金价", "油价", "人民币", "美元", "经济"],
+    "科技前沿": ["ai", "人工智能", "芯片", "科技", "机器人", "新能源", "电动车", "自动驾驶", "航天", "火箭", "卫星", "大模型", "无人机", "互联网", "算力", "半导体", "光伏", "电池"],
+    "社会民生": ["民生", "教育", "医疗", "就业", "社保", "养老", "住房", "天气", "台风", "暴雨", "火灾", "事故", "救援", "警方", "破获", "失踪", "志愿者", "学校", "医院", "交通"],
+    "文体资讯": ["影视", "电影", "体育", "音乐", "文博", "演出", "综艺", "游戏", "运动员", "奥运会", "演唱会", "夺冠", "票房", "文化节", "旅游", "展览", "图书", "出版"],
+}
+
+
+def _classify_sec(text, title, sec_names):
+    """根据标题+正文关键词把条目归入最可能板块；无法归类则返回 None。"""
+    t = ((text or "") + " " + (title or "")).lower()
+    scores = {n: 0 for n in sec_names}
+    for sec, kws in _SEC_KEYWORDS.items():
+        if sec not in scores:
+            continue
+        for kw in kws:
+            if kw in t:
+                scores[sec] += 1
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else None
+
+
 def _build_providers():
     """构造供应商列表，顺序即四级替补优先级：
     1) 主供应商 LLM_*（OpenAI 兼容端点，附同平台免费备援模型）
@@ -642,8 +730,8 @@ def _build_providers():
     """
     providers = []
     api_key = os.environ.get("LLM_API_KEY", "").strip()
-    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE).rstrip("/") + "/"
-    model = os.environ.get("LLM_MODEL", DEFAULT_MODEL).strip()
+    base_url = _normalize_base_url(os.environ.get("LLM_BASE_URL", DEFAULT_BASE))
+    model = os.environ.get("LLM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     if api_key:
         backup_models = []
         if "openrouter.ai" in base_url:
@@ -670,7 +758,9 @@ def _build_providers():
         k = os.environ.get(f"LLM{tag}_API_KEY", "").strip()
         if not k:
             continue
-        b = os.environ.get(f"LLM{tag}_BASE_URL", "").rstrip("/") + "/"
+        b = _normalize_base_url(os.environ.get(f"LLM{tag}_BASE_URL", ""))
+        if not b:
+            continue
         m = os.environ.get(f"LLM{tag}_MODEL", "").strip()
         if not m:
             continue
@@ -720,8 +810,17 @@ def _parse_search_ctx(search_ctx):
             title, content, url = m.group(1).strip(), m.group(2).strip(), (m.group(3) or "").strip()
         else:
             title, content, url = "", block.strip(), ""
-        text = (title + "。" + content) if title else content
+        title = _clean_one(title)
+        content = _clean_one(content)
+        # 优先用 content（通常是正文摘要）；若 content 太短再拼标题
+        if len(content) >= 20:
+            text = content
+        elif title and content:
+            text = title + "。" + content
+        else:
+            text = title or content
         text = re.sub(r"\s+", " ", text).strip()
+        text = _clean_one(text)
         src = "新华社"
         u = url.lower()
         for d, name in _DOMAIN_TO_SOURCE.items():
@@ -734,21 +833,40 @@ def _parse_search_ctx(search_ctx):
 
 
 def _fit_text(text, cmin, cmax):
-    text = (text or "").strip().rstrip("，。；、,.; ")
+    text = _clean_one(text or "")
+    text = text.strip().rstrip("，。；、,.;:?？!")
     if not text:
-        text = "今日相关议题受到媒体关注与报道"
+        return None
     if len(text) > cmax:
         cut = -1
-        for p in ("。", "！", "？", ".", "!", "?"):
+        for p in ("。", "！", "？", ".", "!", "?", "；", ";", "，", ","):
             idx = text[:cmax].rfind(p)
             if idx > cut:
                 cut = idx
-        text = text[:cut + 1] if cut > 0 else text[:cmax]
-    text = text.strip()
-    if len(text) < cmin:
-        tail = "。相关进展受到媒体持续关注与报道。"
-        text = (text + tail)[:cmax]
-    return text
+        text = text[:cut + 1] if cut > 5 else text[:cmax]
+    text = text.strip().rstrip("，。；、,.;:?？!")
+    if cmin <= len(text) <= cmax:
+        return text
+    # 尝试轻度扩展（若原文已有句末标点则不再加逗号）
+    for tail in ("受到广泛关注。", "相关进展持续受到关注。", "各方正密切关注。"):
+        sep = "" if text[-1] in "，。；、,.;:?？!" else "，"
+        candidate = (text + sep + tail).strip()
+        if len(candidate) > cmax:
+            candidate = candidate[:cmax].rstrip("，。；、,.;:?？!") + "。"
+        if cmin <= len(candidate) <= cmax:
+            return candidate
+    return None
+
+
+# 规则拼装兜底：各板块缺额时的自然填充句（长度已在 28–60 之间）
+_NATURAL_FALLBACK = {
+    "国内要闻": "今日国内重要议题受到各方关注，后续详情有待权威部门进一步发布。",
+    "国际新闻": "今日国际局势相关议题持续受到关注，各方保持观察并等待更多消息。",
+    "财经动态": "今日财经市场相关议题受到投资者关注，后续走势仍待进一步观察。",
+    "科技前沿": "今日科技领域相关进展受到行业关注，具体细节有待官方进一步披露。",
+    "社会民生": "今日社会民生相关议题受到公众关注，各方媒体持续跟踪报道进展。",
+    "文体资讯": "今日文体领域相关话题受到关注，后续动态值得期待与进一步关注。",
+}
 
 
 def rule_assemble(search_ctx, cfg, day):
@@ -760,20 +878,31 @@ def rule_assemble(search_ctx, cfg, day):
     sections = cfg["sections"]
     sec_names = [s["name"] for s in sections]
     buckets = {n: [] for n in sec_names}
-    for i, it in enumerate(parsed):
-        buckets[sec_names[i % len(sec_names)]].append(it)
+    fallback_pool = []
+    for it in parsed:
+        sec = _classify_sec(it.get("text", ""), it.get("title", ""), sec_names)
+        if sec:
+            buckets[sec].append(it)
+        else:
+            fallback_pool.append(it)
+    # 用未分类条目按缺额补齐
+    for sec in sec_names:
+        need = next(s["max"] for s in sections if s["name"] == sec) - len(buckets[sec])
+        while need > 0 and fallback_pool:
+            buckets[sec].append(fallback_pool.pop(0))
+            need -= 1
     rep = parsed[0]["source"]
     out_sections = []
     for s in sections:
         name = s["name"]
         picks = buckets[name][:s["max"]]
         while len(picks) < s["min"]:
-            picks.append({"text": f"{name}相关议题持续受到舆论关注，多方媒体跟踪报道",
+            picks.append({"text": _NATURAL_FALLBACK.get(name, f"{name}相关议题持续受到关注"),
                           "source": rep})
         out_sections.append({
             "name": name,
             "items": [
-                {"text": _fit_text(it.get("text", ""), cmin, cmax),
+                {"text": _fit_text(it.get("text", ""), cmin, cmax) or _NATURAL_FALLBACK.get(name, "今日相关议题受到关注"),
                  "source": it.get("source") or rep}
                 for it in picks
             ],
@@ -781,9 +910,26 @@ def rule_assemble(search_ctx, cfg, day):
     sites = cfg.get("hotlist_sites", []) or ["微博热搜"]
     hot_items = []
     for i, it in enumerate(parsed[:12]):
-        t = re.sub(r"\s+", " ", (it.get("title") or it.get("text", "")[:18])).strip()
-        if len(t) > 20:
-            t = t[:20]
+        t = _clean_one(it.get("title") or it.get("text", ""))
+        # 热点榜单允许比正文短，但禁止截断在词中间
+        if len(t) > 28:
+            cut = -1
+            for p in ("。", "！", "？", "；", ";", "，", ","):
+                idx = t[:28].rfind(p)
+                if idx > cut:
+                    cut = idx
+            if cut > 5:
+                t = t[:cut + 1]
+            else:
+                # 按空格或词边界截断，避免半个字
+                s = t[:28]
+                # 回退到最后一个非汉字/字母/数字的边界
+                for j in range(len(s) - 1, 4, -1):
+                    if s[j] in " ，。；、,.;:!?！？":
+                        s = s[:j]
+                        break
+                t = s
+        t = t.strip().rstrip("，。；、,.;:?？!")
         if not t:
             t = "今日热点话题"
         hot_items.append({"text": t, "site": sites[i % len(sites)]})
@@ -835,7 +981,7 @@ def main():
     if not providers:
         print("ERROR: 未配置任何 LLM 供应商（请设置 Secrets.LLM_API_KEY 或 LLM2_*/LLM3_*）")
         sys.exit(1)
-    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_BASE).rstrip("/") + "/"
+    base_url = _normalize_base_url(os.environ.get("LLM_BASE_URL", DEFAULT_BASE))
     model_display = providers[0]["models"][0]
     prev_type = prev_card_type(day)
     seed = load_seed(day)
@@ -918,7 +1064,13 @@ def main():
         try:
             data = rule_assemble(search_ctx, cfg, day)
             if data:
-                print("✅ 规则拼装兜底成稿成功")
+                data = _sanitize_candidate(data, cfg)
+                errs = validate(data, cfg)
+                if errs:
+                    print("  规则拼装未通过校验:", errs[:3])
+                    data = None
+                else:
+                    print("✅ 规则拼装兜底成稿成功")
             else:
                 print("  规则拼装无可用检索结果")
         except Exception as e:
