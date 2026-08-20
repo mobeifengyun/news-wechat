@@ -21,7 +21,7 @@
 
 约束（与本地流程完全一致）:
   - 来源必须是 config.json 的 source_whitelist 白名单
-  - 每条摘要 40-60 字（含标点）
+  - 每条摘要 40-55 字（含标点，validate 缓冲 28-60）
   - 5 个板块各 3-6 条
   - hotspot 6-12 条，site 在 hotlist_sites
   - interaction 仅 1 个 card，且卡型与上一期不同
@@ -510,7 +510,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "生成每日早报的结构化数据。必须遵守以下铁律：\n"
         "1. 所有新闻事实只能引用白名单媒体，绝不使用白名单以外的任何来源"
         "（含境外媒体、自媒体、营销号）。白名单：" + wl + "。\n"
-        "2. 每条新闻摘要严格 35–55 个汉字（含标点），用客观陈述句，不评论、不引申；宁可稍详勿过简。"
+        "2. 每条新闻摘要严格 40–55 个汉字（含标点），用客观陈述句，不评论、不引申；宁可稍详勿过简。"
         "组稿须按「早间新闻晨读（如央视《朝闻天下》式）」思路覆盖当天要闻：国内、国际、财经、科技、民生、文体各大类都要有代表，"
         "重大事件宁多勿漏，不要只盯着一两个话题。\n"
         "3. 来源 source 必须是白名单中的某个媒体名，且确实报道过该事。\n"
@@ -520,12 +520,12 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "绝不做成按钮、绝不允许出现「点赞/在看/转发/分享/抽奖/奖品」等词。"
         "好问题 = 有悬念能勾起好奇 + 有共鸣让人想说 + 零门槛一句话能答 + 值得晒（读者愿意发朋友圈那种）。"
         "lead 与 closing 要有温度，像朋友聊天而非官宣；topic 要有钩子（悬念/反差/共鸣），不要平铺直叙。\n"
-        "7. 【今日一问·面向中老年读者】选题优先照顾银发群体的兴趣与表达习惯，"
-        "挑他们愿意聊、零门槛、无争论的轻松话题：①生活作息与轻养生（散步走路、睡眠质量、喝水、"
-        "节气起居，只聊习惯、绝不聊具体治病偏方）；②家庭与隔代（带孙辈、老伴、亲子、邻里家常）；"
-        "③怀旧记忆（老物件、老歌老电影老剧、青春年代、家乡味、童年零食）；"
-        "④银发日常（智能手机使用困惑与防骗小妙招、广场舞/太极/书法、买菜做饭、棋牌、养花养宠、旅居/周边游）；"
-        "⑤季节天气与衣食住行。严禁拿时政外交、军事、灾情伤亡、"
+        "7. 【今日一问·面向成年读者】选题照顾 30–40 岁城市读者的兴趣与表达习惯，"
+        "挑他们愿意聊、零门槛、无争论的轻松话题：①工作与通勤（职场日常、上下班路上、加班与摸鱼、同事关系）；"
+        "②家庭与生活（伴侣相处、亲子、父母养老、朋友聚会、独居日常）；"
+        "③消费与数码（手机 App、网购、数码产品、智能家居体验）；"
+        "④兴趣与解压（影视综艺、游戏、运动健身、旅行、美食探店、养宠）；"
+        "⑤季节天气与城市生活。严禁拿时政外交、军事、灾情伤亡、"
         "民生政策抱怨（油价房价社保养老医保裁员物价）、投资荐股、医疗健康建议（偏方疗效治病保健品降压降糖减肥中药处方）、"
         "点名个人是非、性别地域阶层对立等易翻车话题来提问。\n"
         "8. 只输出符合指定 schema 的 JSON，不要任何解释文字。\n"
@@ -565,7 +565,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     if theme:
         user_prompt += (
             f"【今日应景】今天是「{theme}」，今日一问请优先结合这个节日/节气来设计"
-            f"（须贴近中老年生活、遵守规则7方向与不涉红线）。出题角度参考："
+            f"（须贴近成年读者日常、遵守规则7方向与不涉红线）。出题角度参考："
             f"中秋·端午·重阳等传统节日→团圆家宴与敬老；立春·立秋·冬至等节气→时令饮食与起居养生；"
             f"国庆·元旦→休假出行与家庭聚会；清明→回乡祭祖或云祭扫。给一个具体可答的场景即可，不要硬凑。\n\n"
         )
@@ -589,7 +589,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         '  "greeting": "一句早安问候（≤20字）",\n'
         '  "quote": "原创/公版励志微语（≤30字）",\n'
         '  "sections": [\n'
-        '    {"name": "国内要闻", "items": [{"text": "40-60字摘要", "source": "央视新闻"}]},\n'
+        '    {"name": "国内要闻", "items": [{"text": "40-55字摘要", "source": "央视新闻"}]},\n'
         '    {"name": "国际新闻", "items": [...]},\n'
         '    {"name": "财经动态", "items": [...]},\n'
         '    {"name": "科技前沿", "items": [...]},\n'
@@ -647,11 +647,13 @@ def _build_providers():
     if api_key:
         backup_models = []
         if "openrouter.ai" in base_url:
+            # 免费模型 ID 会随 OpenRouter 调整，优先选近期验证可用的 slug
             backup_models = [
-                "deepseek/deepseek-chat:free",
-                "qwen/qwen-2.5-72b-instruct:free",
-                "meta-llama/llama-3.3-70b-instruct:free",
-                "google/gemma-2-9b-it:free",
+                "deepseek/deepseek-chat-v3.1:free",
+                "deepseek/deepseek-r1-0528:free",
+                "qwen/qwen3-32b:free",
+                "meta-llama/llama-3.3-8b-instruct:free",
+                "google/gemma-3n-e4b-it:free",
             ]
         models = []
         for m in [model] + backup_models:
@@ -848,9 +850,7 @@ def main():
     )
 
     if use_kimi:
-        if model == DEFAULT_MODEL:  # 用户未显式指定模型时给 Kimi 默认
-            model = "kimi-k2.6"
-        print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model}")
+        print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model_display}")
     elif use_tavily:
         print("检索模式：Tavily（限定白名单域名 + 近 2 日新闻）")
         _d = date.fromisoformat(day)
