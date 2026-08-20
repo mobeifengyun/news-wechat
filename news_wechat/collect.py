@@ -290,7 +290,7 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
 
 
 # ---------------- Kimi / Moonshot 联网搜索 ----------------
-def _post_with_retry(url, headers, data, timeout=30, max_retry=2):
+def _post_with_retry(url, headers, data, timeout=90, max_retry=1):
     """带 429 限流退避的 POST。timeout 默认 30s，避免跨国慢节点把整个 workflow 卡死。"""
     import requests
     for i in range(max_retry):
@@ -704,7 +704,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     if search_ctx:
         user_prompt += (
             "以下是联网检索到的白名单媒体素材（仅可据此成稿，不得引用素材之外的信息）：\n"
-            + "\n\n".join(search_ctx)[:6000]
+            + "\n\n".join(search_ctx)[:4000]
             + "\n\n"
         )
     if seed:
@@ -1213,7 +1213,7 @@ def main():
         for q in queries:
             try:
                 print(f"  Tavily 查询: {q}")
-                res = tavily_search(q, tavily_key, max_results=4, days=2)
+                res = tavily_search(q, tavily_key, max_results=2, days=2)
                 print(f"    返回 {len(res)} 条")
                 search_ctx += res
             except Exception as e:
@@ -1228,7 +1228,7 @@ def main():
     for provider in providers:
         print(f"\n▶ 尝试 {provider['name']}（候选模型 {len(provider['models'])} 个）")
         try:
-            for attempt in range(5):
+            for attempt in range(2):
                 sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
                 print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                 try:
