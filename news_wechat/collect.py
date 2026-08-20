@@ -280,7 +280,7 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
     # OpenRouter 推荐加 Referer / Title，帮助路由与故障排查
     if "openrouter.ai" in base_url:
         headers.setdefault("HTTP-Referer", "https://github.com/mobeifengyun/news-wechat")
-        headers.setdefault("X-Title", "报简说")
+        headers.setdefault("X-Title", "baojianshuo")
     r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
