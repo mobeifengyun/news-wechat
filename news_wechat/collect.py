@@ -570,13 +570,15 @@ def validate(data, cfg):
             n = len(t)
             if not (cmin <= n <= cmax):
                 errors.append(
-                    f"[{s['name']}] 第{i}条字数 {n}（要求 {cmin}-{cmax}）：{t[:18]}…"
+                    f"[{s['name']}] 第{i}条字数 {n}（要求 {cmin}-{cmax}），"
+                    f"必须通过补充时间/地点/主体/影响等真实细节扩写到 {cmin} 字以上：{t[:18]}…"
                 )
             sec_src = set(s.get("sources") or wl)
             if it.get("source", "") not in sec_src:
+                allowed = "、".join(sorted(sec_src))
                 errors.append(
-                    f"[{s['name']}] 第{i}条来源「{it.get('source')}」不在本板块限定来源"
-                    + ("" if s.get("sources") else "（白名单）")
+                    f"[{s['name']}] 第{i}条来源「{it.get('source')}」不在本板块限定来源，"
+                    f"必须改为：{allowed}"
                 )
         if s["name"] not in names:
             errors.append(f"板块名「{s['name']}」与配置不符")
@@ -633,8 +635,8 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     sec_names = "、".join(s["name"] for s in cfg["sections"])
     sec_specs = "；".join(f"{s['name']}: {s['min']}-{s['max']} 条" for s in cfg["sections"])
-    sec_src_specs = "；".join(
-        f"{s['name']}仅限来源：{'、'.join(s.get('sources', [])) or '（不限）'}"
+    sec_src_specs = "\n".join(
+        f"  ⚠ {s['name']} 只能用：{' / '.join(s.get('sources', [])) or '（不限）'}"
         for s in cfg["sections"]
     )
     wl = "、".join(cfg["source_whitelist"])
@@ -686,8 +688,11 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"【时效性红线】本日报只收录 {date_cn} 当天（及前一日）发生的「新近新闻」。"
         f"不要写早于 {day} 超过 2 天的旧闻、周年纪念、历史回顾或旧热点重发；"
         f"每条新闻请先在脑中确认其报道日期在 {date_cn} 前后，无法确认日期的旧闻一律不采用。\n\n"
-        f"各板块（顺序与名称必须严格一致）：{sec_names}。\n"
-        f"【各板块限定来源（硬约束，来源只能从下列中选，超出即作废重生成）】{sec_src_specs}。\n"
+        f"各板块（顺序与名称必须严格一致）：{sec_names}。\n\n"
+        f"【铁律·各板块限定来源（校验会逐条检查，来源必须从下列清单中选，超出即作废重生成）】\n"
+        f"{sec_src_specs}\n"
+        f"任何一条新闻的 source 字段必须是上面对应板块清单里的名字，一字不差。"
+        f"例如财经动态只能用新华社/央视新闻/证券时报/第一财经/财联社，绝不可用人民网、新华网等。\n\n"
         f"【板块条数硬要求（校验会精确检查，不满足直接重生成）】{sec_specs}。\n"
         f"请按「早间新闻晨读」思路组稿：覆盖当天国内外要闻、财经、科技、民生、文体，尽量不遗漏重大事件；"
         f"每个板块先按「重要等级」从高到低筛选当天真实新闻，最重要的排最前；"
@@ -732,12 +737,12 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         '  "greeting": "一句早安问候（≤20字）",\n'
         '  "quote": "原创/公版励志微语（≤30字）",\n'
         '  "sections": [\n'
-        '    {"name": "国内要闻", "items": [{"text": "40-55字摘要", "source": "央视新闻"}]},\n'
-        '    {"name": "国际新闻", "items": [...]},\n'
-        '    {"name": "财经动态", "items": [...]},\n'
-        '    {"name": "科技前沿", "items": [...]},\n'
-        '    {"name": "社会民生", "items": [...]},\n'
-        '    {"name": "文体资讯", "items": [...]}\n'
+        '    {"name": "国内要闻", "items": [{"text": "40-55字摘要", "source": "央视新闻"}]},   // source 仅限：新华社/人民日报/央视新闻/中国新闻网/央视网\n'
+        '    {"name": "国际新闻", "items": [{"text": "40-55字摘要", "source": "新华社"}]},     // source 仅限：新华社/央视新闻/环球时报/参考消息/中国日报\n'
+        '    {"name": "财经动态", "items": [{"text": "40-55字摘要", "source": "证券时报"}]},   // source 仅限：新华社/央视新闻/证券时报/第一财经/财联社\n'
+        '    {"name": "科技前沿", "items": [{"text": "40-55字摘要", "source": "科技日报"}]},   // source 仅限：新华社/央视新闻/科技日报/IT之家/量子位\n'
+        '    {"name": "社会民生", "items": [{"text": "40-55字摘要", "source": "澎湃新闻"}]},   // source 仅限：新华社/央视新闻/澎湃新闻/新京报/中国青年报\n'
+        '    {"name": "文体资讯", "items": [{"text": "40-55字摘要", "source": "新京报"}]}     // source 仅限：新华社/央视新闻/新京报/澎湃新闻/中国青年报\n'
         "  ],\n"
         '  "hotspot": {"name": "热点榜单", "items": [{"text": "话题标题", "site": "微博热搜"}]},\n'
         '  "interaction": {\n'
@@ -760,8 +765,12 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
             "\n上一次生成未通过校验，请修正以下问题后重新输出：\n- "
             + "\n- ".join(errors)
             + "\n"
-            "修正要求：①字数不足时，通过补充时间、地点、主体、影响等真实细节扩写，"
-            "不要只加'相关'等无意义词；②来源不在白名单时，从白名单中换一个确实报道过该事的媒体名。\n"
+        "修正要求（必须逐项改正）：\n"
+        "①字数不足 20 字时，必须通过补充具体时间、地点、主体、事件影响等真实细节进行扩写，"
+        "严禁只加'相关'等无意义词；\n"
+        "②来源 source 必须严格对应该板块的限定来源清单，若当前来源不在清单内，"
+        "必须改为该板块限定清单中的媒体名（如财经动态的人民网必须改为证券时报/第一财经/财联社等），"
+        "source 字段必须一字不差。\n"
         )
     return sys_prompt, user_prompt
 
@@ -1262,7 +1271,7 @@ def main():
     for provider in providers:
         print(f"\n▶ 尝试 {provider['name']}（候选模型 {len(provider['models'])} 个）")
         try:
-            for attempt in range(2):
+            for attempt in range(3):
                 sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
                 print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                 try:
