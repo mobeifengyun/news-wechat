@@ -306,15 +306,9 @@ def _post_with_retry(url, headers, data, timeout=90, max_retry=1):
                 continue
             raise
         if r.status_code == 429:
-            wait = 20
-            try:
-                wait = int(r.headers.get("Retry-After", 20))
-            except Exception:
-                pass
-            wait = min(max(wait, 15), 90)
-            print(f"  ⏳ 429 限流，等 {wait}s 重试 ({i+1}/{max_retry})")
-            time.sleep(wait)
-            continue
+            # 免费模型限流：重试无意义，反而会拖长兜底启用时间，直接失败走降级
+            print(f"  ⚠ 429 限流，立即失败（不重试，直接走下一供应商/兜底）")
+            return r
         return r
     return r
 
