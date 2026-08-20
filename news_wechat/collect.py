@@ -263,6 +263,7 @@ def tavily_search(query, api_key, max_results=5, days=2):
 def llm_chat(system, user, base_url, api_key, model, tools=None):
     import requests
     url = base_url.rstrip("/") + "/chat/completions"
+    print(f"  llm_chat: model={model} url={url}")
     body = {
         "model": model,
         "messages": [
@@ -283,20 +284,24 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
         headers.setdefault("X-Title", "baojianshuo")
     r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    content = r.json()["choices"][0]["message"]["content"]
+    print(f"  llm_chat: 返回 {len(content)} 字符")
+    return content
 
 
 # ---------------- Kimi / Moonshot 联网搜索 ----------------
-def _post_with_retry(url, headers, data, timeout=150, max_retry=5):
-    """带 429 限流退避的 POST。Kimi 免费档 RPM 很低，一次采集会连发多轮请求，
-    必须遇到 429 就按 Retry-After 等待后重试，否则整轮失败。"""
+def _post_with_retry(url, headers, data, timeout=30, max_retry=2):
+    """带 429 限流退避的 POST。timeout 默认 30s，避免跨国慢节点把整个 workflow 卡死。"""
     import requests
     for i in range(max_retry):
         try:
+            print(f"    → POST {url} ({len(data)} bytes, timeout={timeout}s)")
             r = requests.post(url, headers=headers, data=data, timeout=timeout)
+            print(f"    ← HTTP {r.status_code} ({len(r.content)} bytes)")
         except requests.RequestException as e:
+            print(f"    ⚠ 请求异常: {e}")
             if i < max_retry - 1:
-                print(f"  ⏳ 网络异常 {e}，5s 后重试 ({i+1}/{max_retry})")
+                print(f"  ⏳ 5s 后重试 ({i+1}/{max_retry})")
                 time.sleep(5)
                 continue
             raise
@@ -878,7 +883,9 @@ def _build_providers():
 def _generate_once(provider, system, user, use_tavily, use_kimi, search_mode):
     """用单个供应商的候选模型依次尝试生成；鉴权失败抛 LLMAuthError。"""
     last_err = None
+    print(f"  _generate_once: kind={provider['kind']} base={provider['base_url']} models={provider['models']}")
     for model in provider["models"]:
+        print(f"    尝试模型: {model}")
         try:
             if provider["kind"] == "kimi":
                 return kimi_chat(system, user, provider["base_url"], provider["api_key"], model)
@@ -1205,7 +1212,10 @@ def main():
         ]
         for q in queries:
             try:
-                search_ctx += tavily_search(q, tavily_key, max_results=4, days=2)
+                print(f"  Tavily 查询: {q}")
+                res = tavily_search(q, tavily_key, max_results=4, days=2)
+                print(f"    返回 {len(res)} 条")
+                search_ctx += res
             except Exception as e:
                 print("  Tavily 检索失败:", e)
     else:
@@ -1220,7 +1230,7 @@ def main():
         try:
             for attempt in range(5):
                 sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
-                print(f"  第 {attempt+1} 次生成…")
+                print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                 try:
                     raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
                     last_raw = raw
