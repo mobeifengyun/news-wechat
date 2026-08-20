@@ -804,8 +804,9 @@ def _build_providers():
     if api_key:
         backup_models = []
         if "openrouter.ai" in base_url:
-            # 免费模型 ID 会随 OpenRouter 调整，优先选近期验证可用的 slug
+            # 免费模型 ID 会随 OpenRouter 调整；openrouter/free 让平台自动选当前可用免费模型
             backup_models = [
+                "openrouter/free",
                 "deepseek/deepseek-chat-v3.1:free",
                 "deepseek/deepseek-r1-0528:free",
                 "qwen/qwen3-32b:free",
