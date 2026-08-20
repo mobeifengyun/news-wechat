@@ -100,6 +100,14 @@ jobs:
           PY
           if [ -f /tmp/_skip_flag ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
 
+      - name: force 模式清除当日旧产出
+        if: ${{ github.event.inputs.force == 'true' }}
+        run: |
+          DAY="${{ steps.check.outputs.day }}"
+          rm -f "news_wechat/output/news_${DAY}.json"
+          rm -f "news_wechat/output/article_${DAY}.html"
+          echo "已清除 ${DAY} 旧产出，强制重新采集"
+
       - name: 采集 + 成稿（大模型联网搜索）
         id: collect
         if: ${{ steps.check.outputs.skip != 'true' }}
