@@ -628,6 +628,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     theme = festival_of(d)
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     sec_names = "、".join(s["name"] for s in cfg["sections"])
+    sec_specs = "；".join(f"{s['name']}: {s['min']}-{s['max']} 条" for s in cfg["sections"])
     wl = "、".join(cfg["source_whitelist"])
     sites = "、".join(cfg["hotlist_sites"])
 
@@ -667,8 +668,9 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"\n10. 时效性铁律（最高优先级）：所有新闻必须是「{day}」当天（或前一日 24–48 小时内）"
         f"由白名单媒体新近发布/滚动报道的事件，报道日期不得早于 {day} 超过 2 天。"
         f"严禁采用周年纪念、历史回顾、旧闻重发、科普百科、以及在 {day} 之前就已发生且已被广泛报道过的「旧热点」。"
-        f"若联网检索只得到旧闻、或某条结果无法确认其报道日期在 {day} 前后，宁可该板块少写几条，"
-        f"也绝不允许把旧闻当成今日新闻塞进来——这是硬红线，违反即作废重生成。"
+        f"若联网检索只得到旧闻、或某条结果无法确认其报道日期在 {day} 前后，"
+        f"绝不允许把旧闻当成今日新闻塞进来——这是硬红线，违反即作废重生成。"
+        f"凑够条数时，优先用检索到的「当天、真实、可信」的次重要新闻补足，而非旧闻。\n"
     )
 
     user_prompt = (
@@ -676,9 +678,13 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"【时效性红线】本日报只收录 {date_cn} 当天（及前一日）发生的「新近新闻」。"
         f"不要写早于 {day} 超过 2 天的旧闻、周年纪念、历史回顾或旧热点重发；"
         f"每条新闻请先在脑中确认其报道日期在 {date_cn} 前后，无法确认日期的旧闻一律不采用。\n\n"
-        f"各板块（顺序与名称必须严格一致，每板块 4–6 条）：{sec_names}。\n"
+        f"各板块（顺序与名称必须严格一致）：{sec_names}。\n"
+        f"【板块条数硬要求（校验会精确检查，不满足直接重生成）】{sec_specs}。\n"
         f"请按「早间新闻晨读」思路组稿：覆盖当天国内外要闻、财经、科技、民生、文体，尽量不遗漏重大事件；"
-        f"每个板块挑当天最具关注度、最值得读者知道的 4–6 条。\n"
+        f"每个板块先按「重要等级」从高到低筛选当天真实新闻，最重要的排最前；"
+        f"条数必须落在区间内，且**每个板块都必须凑够下限条数（这是硬指标）**："
+        f"若重磅新闻不足下限，用同板块检索结果中次重要但真实可信、确为当天的条目补足，"
+        f"绝不可低于下限，也绝不可用旧闻、编造或境外信源凑数。\n"
         f"各板块检索/选题方向：国内要闻=今日国内大事·政策发布·重大工程·航天科技成就；"
         f"国际新闻=国际 外交部 环球；财经动态=财经 股市 央行 楼市；科技前沿=AI 芯片 航天 新能源；"
         f"社会民生=民生 教育 医疗 就业 暖新闻；文体资讯=影视 体育 音乐 文博。\n\n"
@@ -1079,25 +1085,30 @@ def rule_assemble(search_ctx, cfg, day):
     for s in sections:
         name = s["name"]
         real = buckets[name][:s["max"]]
-        picks = list(real)  # 已分类的真实条目
-        # 真实条目不足 min 时用 _pick_fallback 补
+        picks = [{"text": it.get("text", ""), "source": it.get("source") or rep, "fb": False}
+                 for it in real]
+        # 先复用其它板块没用上的真实检索条目（内容更实），再补自然填充句
+        while len(picks) < s["min"] and fallback_pool:
+            it = fallback_pool.pop(0)
+            picks.append({"text": it.get("text", ""), "source": it.get("source") or rep, "fb": False})
         while len(picks) < s["min"]:
             picks.append({"text": _pick_fallback(name, fb_idx[name]),
-                          "source": rep})
+                          "source": rep, "fb": True})
             fb_idx[name] += 1
         section_items = []
         for it in picks:
-            raw_text = it.get("text", "")
+            # 自然填充句（fb=True）为有意设计的兜底内容，不再被 _is_meaningless 误杀
+            if it.get("fb"):
+                section_items.append({"text": it["text"], "source": it["source"]})
+                continue
+            raw_text = it["text"]
             fitted = _fit_text(raw_text, cmin, cmax)
-            # 真实条目质量不合格（无意义/过短/英文主导）→ 用 fallback 替换
-            if fitted and _is_meaningless(fitted):
-                fitted = None
-            final_text = fitted or _pick_fallback(name, fb_idx[name])
-            fb_idx[name] += (1 if not fitted else 0)
-            section_items.append({
-                "text": final_text,
-                "source": it.get("source") or rep if fitted else rep,
-            })
+            if not fitted or _is_meaningless(fitted):
+                fitted = _pick_fallback(name, fb_idx[name])
+                fb_idx[name] += 1
+                section_items.append({"text": fitted, "source": rep})
+                continue
+            section_items.append({"text": fitted, "source": it["source"]})
         out_sections.append({"name": name, "items": section_items})
     sites = cfg.get("hotlist_sites", []) or ["微博热搜"]
     hot_items = []
