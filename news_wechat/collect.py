@@ -572,8 +572,12 @@ def validate(data, cfg):
                 errors.append(
                     f"[{s['name']}] 第{i}条字数 {n}（要求 {cmin}-{cmax}）：{t[:18]}…"
                 )
-            if it.get("source", "") not in wl:
-                errors.append(f"[{s['name']}] 第{i}条来源「{it.get('source')}」不在白名单")
+            sec_src = set(s.get("sources") or wl)
+            if it.get("source", "") not in sec_src:
+                errors.append(
+                    f"[{s['name']}] 第{i}条来源「{it.get('source')}」不在本板块限定来源"
+                    + ("" if s.get("sources") else "（白名单）")
+                )
         if s["name"] not in names:
             errors.append(f"板块名「{s['name']}」与配置不符")
 
@@ -629,6 +633,10 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     sec_names = "、".join(s["name"] for s in cfg["sections"])
     sec_specs = "；".join(f"{s['name']}: {s['min']}-{s['max']} 条" for s in cfg["sections"])
+    sec_src_specs = "；".join(
+        f"{s['name']}仅限来源：{'、'.join(s.get('sources', [])) or '（不限）'}"
+        for s in cfg["sections"]
+    )
     wl = "、".join(cfg["source_whitelist"])
     sites = "、".join(cfg["hotlist_sites"])
 
@@ -679,6 +687,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"不要写早于 {day} 超过 2 天的旧闻、周年纪念、历史回顾或旧热点重发；"
         f"每条新闻请先在脑中确认其报道日期在 {date_cn} 前后，无法确认日期的旧闻一律不采用。\n\n"
         f"各板块（顺序与名称必须严格一致）：{sec_names}。\n"
+        f"【各板块限定来源（硬约束，来源只能从下列中选，超出即作废重生成）】{sec_src_specs}。\n"
         f"【板块条数硬要求（校验会精确检查，不满足直接重生成）】{sec_specs}。\n"
         f"请按「早间新闻晨读」思路组稿：覆盖当天国内外要闻、财经、科技、民生、文体，尽量不遗漏重大事件；"
         f"每个板块先按「重要等级」从高到低筛选当天真实新闻，最重要的排最前；"
@@ -1080,20 +1089,36 @@ def rule_assemble(search_ctx, cfg, day):
             buckets[sec].append(fallback_pool.pop(0))
             need -= 1
     rep = parsed[0]["source"]
+
+    def _norm_source(src, sec):
+        """把来源收敛到本板块限定来源内，避免兜底产出被按板块来源校验拒绝。"""
+        ss = sec.get("sources")
+        if not ss:
+            return src or "新华社"
+        src = src or ss[0]
+        if src in ss:
+            return src
+        doms = WL_DOMAINS.get(src)
+        if doms:
+            for cand in ss:
+                if WL_DOMAINS.get(cand) == doms:
+                    return cand
+        return ss[0]
+
     out_sections = []
     fb_idx = {n: 0 for n in sec_names}  # 每板块填充句轮询指针
     for s in sections:
         name = s["name"]
         real = buckets[name][:s["max"]]
-        picks = [{"text": it.get("text", ""), "source": it.get("source") or rep, "fb": False}
+        picks = [{"text": it.get("text", ""), "source": _norm_source(it.get("source") or rep, s), "fb": False}
                  for it in real]
         # 先复用其它板块没用上的真实检索条目（内容更实），再补自然填充句
         while len(picks) < s["min"] and fallback_pool:
             it = fallback_pool.pop(0)
-            picks.append({"text": it.get("text", ""), "source": it.get("source") or rep, "fb": False})
+            picks.append({"text": it.get("text", ""), "source": _norm_source(it.get("source") or rep, s), "fb": False})
         while len(picks) < s["min"]:
             picks.append({"text": _pick_fallback(name, fb_idx[name]),
-                          "source": rep, "fb": True})
+                          "source": _norm_source(rep, s), "fb": True})
             fb_idx[name] += 1
         section_items = []
         for it in picks:
@@ -1106,7 +1131,7 @@ def rule_assemble(search_ctx, cfg, day):
             if not fitted or _is_meaningless(fitted):
                 fitted = _pick_fallback(name, fb_idx[name])
                 fb_idx[name] += 1
-                section_items.append({"text": fitted, "source": rep})
+                section_items.append({"text": fitted, "source": _norm_source(rep, s)})
                 continue
             section_items.append({"text": fitted, "source": it["source"]})
         out_sections.append({"name": name, "items": section_items})
