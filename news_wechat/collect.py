@@ -1318,4 +1318,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print("collect.py 启动", flush=True)
     main()

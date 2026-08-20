@@ -123,6 +123,7 @@ jobs:
           LLM3_MODEL: ${{ secrets.LLM3_MODEL }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           SEARCH_MODE: ${{ secrets.SEARCH_MODE }}
+          PYTHONUNBUFFERED: "1"
         run: python news_wechat/collect.py "${{ steps.check.outputs.day }}"
 
       - name: 渲染 + 合规审核（BLOCK 会中断）
