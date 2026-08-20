@@ -277,6 +277,10 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    # OpenRouter 推荐加 Referer / Title，帮助路由与故障排查
+    if "openrouter.ai" in base_url:
+        headers.setdefault("HTTP-Referer", "https://github.com/mobeifengyun/news-wechat")
+        headers.setdefault("X-Title", "报简说")
     r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
@@ -499,7 +503,7 @@ def _sanitize_candidate(cand, cfg=None):
     hotspot 字段已在前面的截断逻辑里做过净化，不再重复；否则 12 字门槛会把短热点清空。
     """
     if not isinstance(cand, dict):
-        return cand
+        return None
     for field in ("greeting", "quote", "title"):
         if field in cand and isinstance(cand[field], str):
             cand[field] = _clean_one(cand[field])
@@ -524,6 +528,9 @@ def _sanitize_candidate(cand, cfg=None):
 # ---------------- 校验 ----------------
 def validate(data, cfg):
     errors = []
+    if not isinstance(data, dict):
+        errors.append(f"成稿结果必须是 JSON 对象，实际得到 {type(data).__name__}")
+        return errors
     wl = set(cfg["source_whitelist"])
     cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
     names = {s["name"] for s in cfg["sections"]}
@@ -804,14 +811,15 @@ def _build_providers():
     if api_key:
         backup_models = []
         if "openrouter.ai" in base_url:
-            # 免费模型 ID 会随 OpenRouter 调整；openrouter/free 让平台自动选当前可用免费模型
+            # 免费模型 ID 会随 OpenRouter 调整；优先尝试具体 :free 模型，
+            # openrouter/free 自动路由放在最后兜底。
             backup_models = [
-                "openrouter/free",
                 "deepseek/deepseek-chat-v3.1:free",
-                "deepseek/deepseek-r1-0528:free",
                 "qwen/qwen3-32b:free",
-                "meta-llama/llama-3.3-8b-instruct:free",
                 "google/gemma-3n-e4b-it:free",
+                "meta-llama/llama-3.3-8b-instruct:free",
+                "deepseek/deepseek-r1-0528:free",
+                "openrouter/free",
             ]
         models = []
         for m in [model] + backup_models:
@@ -860,14 +868,18 @@ def _generate_once(provider, system, user, use_tavily, use_kimi, search_mode):
             raise
         except Exception as e:
             code = None
+            body = ""
             try:
                 code = e.response.status_code
+                body = (e.response.text or "")[:200]
             except Exception:
                 pass
             if code in (401, 402, 403):
                 raise LLMAuthError(f"{provider['name']} 模型 {model} 鉴权失败(HTTP {code})")
             last_err = str(e)
             print(f"    {provider['name']} 模型 {model} 失败: {str(e)[:90]}")
+            if body:
+                print(f"      响应: {body}")
             continue
     raise RuntimeError(last_err or "所有候选模型均失败")
 
@@ -1152,7 +1164,11 @@ def main():
                     if m:
                         raw = m.group(0)
                     cand = json.loads(raw)
+                    if not isinstance(cand, dict):
+                        raise ValueError(f"模型返回的是 {type(cand).__name__}，必须返回 JSON 对象")
                     cand = _sanitize_candidate(cand, cfg)
+                    if cand is None:
+                        raise ValueError("净化后成稿为空")
                 except LLMAuthError as e:
                     print("  ⛔", e)
                     break  # 该供应商鉴权失败，跳到下一个供应商
