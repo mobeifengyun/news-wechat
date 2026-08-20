@@ -373,10 +373,19 @@ _CUT_MARKERS = [
     "相关报道见第", "相关报道见 ", "全部导航", "旗下网站", "报系",
     "点击排行", "所在位置", "友情链接", "加入收藏", "设为首页", "请您留言",
     "登录 -", "登录—", "登录 ", "登录  ", "注册 -", "注册—",
-    "首页 |", "首页|", "首页 ", "网站地图", "RSS", "xml",
+    "首页 |", "首页|", "首页 ", "网站地图", "RSS", "xml", "sitemap",
     "时政 热点", "时政　热点", "深瞳 访谈", "科技新观察", "创新故事",
     "科普一下", "庆祝中国", "看您的运", "看省的运", "看省运",
     "看鹤城", "齐齐哈尔", "烤 肉", "烤肉、", "烤肉 、", "看烤",
+    # 英文站点导航/栏目名（常见于中国日报英文站等）
+    "Search HOME", "HOME CHINA", "CHINA WORLD", "WORLD BUSINESS",
+    "BUSINESS CULTURE", "CULTURE TRAVEL", "TRAVEL VIDEO", "VIDEO SPORTS",
+    "HOME |", "HOME|", "CHINA |", "WORLD |", "BUSINESS |", "SPORTS |",
+    "LIFESTYLE", "OPINION", "PHOTO", "VIDEO", "IN-DEPTH", "TECH", "SCI-TECH",
+    "About China", "Today's Quote", "Sponsored", "Newsletter",
+    "新闻频道 ;)", "新闻频道;)", "中国新闻 生活服务台", "生活服务台",
+    "北交所频道", "新京号", "电子报", "千龙网", "贝壳财经", "北京BEIJING",
+    "新京雅集", "爱心模式", "线索报料", "商务合作",
 ]
 
 # 标题/正文中常见的尾部站点/平台/栏目名（来源由 URL 单独回填，这里只保留新闻标题本身）
@@ -387,7 +396,8 @@ _NOISE_SUFFIXES = [
     "钛媒体", "虎嗅", "雷锋网", "量子位", "36氪", "IT之家", "财联社",
     "界面新闻", "21世纪经济报道", "每日经济新闻", "中国证券报", "经济观察报",
     "科技日报", "证券时报", "第一财经", "上海证券报", "经济日报", "中国青年报",
-    "东南网", "东北网", "西南网", "华西网",
+    "东南网", "东北网", "西南网", "华西网", "中国日报", "China Daily",
+    "新京报客户端", "新浪新闻", "腾讯新闻", "网易新闻", "搜狐新闻",
 ]
 
 
@@ -396,6 +406,19 @@ def _clean_one(text):
     if not isinstance(text, str):
         return text
     t = text.strip()
+    if not t:
+        return ""
+    # 快速丢弃：整段主要由英文大写导航词组成（如中国日报英文站导航）
+    english_nav_words = ("HOME", "CHINA", "WORLD", "BUSINESS", "CULTURE",
+                         "TRAVEL", "VIDEO", "SPORTS", "LIFESTYLE", "OPINION",
+                         "PHOTO", "IN-DEPTH", "TECH", "SCI-TECH", "Search")
+    if sum(1 for w in english_nav_words if w in t) >= 3:
+        return ""
+    # 快速丢弃：英文字符占比过高且中文极少（视为外文站导航/标题）
+    cn_chars = len(re.findall(r"[\u4e00-\u9fff]", t))
+    en_chars = len(re.findall(r"[a-zA-Z]", t))
+    if en_chars > 20 and cn_chars < 5:
+        return ""
     # 整段由"导航/排行/版次/报系"等多重强噪声构成 → 视为不可用，整段丢弃
     strong_noise = ("全部导航", "友情链接", "旗下网站", "点击排行",
                     "报系", "所在位置", "加入收藏", "设为首页",
@@ -908,6 +931,16 @@ def _parse_search_ctx(search_ctx):
         text = _clean_one(text)
         if not text:
             continue
+        # 二次过滤：无意义填充句、过短、英文主导
+        cn_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+        if len(text) < 16 or cn_chars < 8:
+            continue
+        # 丢弃明显的外文站导航/栏目名（英文词过多）
+        if len(re.findall(r"[a-zA-Z]", text)) > cn_chars:
+            continue
+        # 丢弃「相关议题受到关注」这类空泛填充
+        if re.search(r"相关(?:议题|进展|动态|话题).*?(?:受到|引发).*?(?:关注|讨论|观察)", text) and cn_chars < 25:
+            continue
         src = "新华社"
         u = url.lower()
         for d, name in _DOMAIN_TO_SOURCE.items():
@@ -987,6 +1020,26 @@ _NATURAL_FALLBACK = {
 }
 
 
+def _is_meaningless(text):
+    """判断一段文本是否为空泛/无意义填充（用于规则拼装兜底质量控制）。"""
+    if not isinstance(text, str) or not text:
+        return True
+    cn_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    if cn_chars < 12:
+        return True
+    # 空泛套话模式
+    vague_patterns = [
+        r"相关(?:议题|进展|动态|话题).*?(?:受到|引发).*?(?:关注|讨论|观察|披露)",
+        r"(?:今日|近期).*?(?:相关|有关).*?(?:议题|话题|进展).*?(?:值得|受到|引发)",
+        r"(?:各方|多方|有关).*?(?:持续|纷纷).*?(?:关注|讨论|观察|报道)",
+        r"后续.*?(?:进展|动态|走势).*?(?:有待|仍待|待).*?(?:进一步|观察|披露)",
+    ]
+    for p in vague_patterns:
+        if re.search(p, text):
+            return True
+    return False
+
+
 def _pick_fallback(name, idx):
     """按板块名+序号轮询取填充句，避免同一句重复出现。"""
     pool = _NATURAL_FALLBACK.get(name) or [f"{name}相关议题持续受到关注。"]
@@ -1027,22 +1080,32 @@ def rule_assemble(search_ctx, cfg, day):
             picks.append({"text": _pick_fallback(name, fb_idx[name]),
                           "source": rep})
             fb_idx[name] += 1
-        out_sections.append({
-            "name": name,
-            "items": [
-                {"text": (_fit_text(it.get("text", ""), cmin, cmax)
-                          or _pick_fallback(name, fb_idx[name])),
-                 "source": it.get("source") or rep}
-                for it in picks
-            ],
-        })
+        section_items = []
+        for it in picks:
+            raw_text = it.get("text", "")
+            fitted = _fit_text(raw_text, cmin, cmax)
+            # 真实条目质量不合格（无意义/过短/英文主导）→ 用 fallback 替换
+            if fitted and _is_meaningless(fitted):
+                fitted = None
+            final_text = fitted or _pick_fallback(name, fb_idx[name])
+            fb_idx[name] += (1 if not fitted else 0)
+            section_items.append({
+                "text": final_text,
+                "source": it.get("source") or rep if fitted else rep,
+            })
+        out_sections.append({"name": name, "items": section_items})
     sites = cfg.get("hotlist_sites", []) or ["微博热搜"]
     hot_items = []
-    for i, it in enumerate(parsed[:12]):
+    hot_src_idx = 0
+    for it in parsed:
+        if len(hot_items) >= 12:
+            break
         # 优先用标题（更短更适合热点），标题为空才用正文
         t = _clean_one(it.get("title") or "")
         if not t or len(t) < 4:
             t = _clean_one(it.get("text", ""))
+        if not t or _is_meaningless(t):
+            continue
         # 热点榜单允许比正文短，但禁止截断在词中间
         if len(t) > 28:
             cut = -1
@@ -1063,8 +1126,9 @@ def rule_assemble(search_ctx, cfg, day):
                 t = s
         t = t.strip().rstrip("，。；、,.;:?？!")
         if not t or len(t) < 4:
-            t = f"今日热点话题{i+1}"
-        hot_items.append({"text": t, "site": sites[i % len(sites)]})
+            continue
+        hot_items.append({"text": t, "site": sites[hot_src_idx % len(sites)]})
+        hot_src_idx += 1
     while len(hot_items) < 6:
         hot_items.append({"text": f"热榜话题{len(hot_items)+1}持续引发关注", "site": sites[0]})
     interaction = {
