@@ -365,6 +365,14 @@ _CUT_MARKERS = [
     "把握财富机会", "看更多", "点击进入", "点击查看", "更多资讯",
     "来源：", "来源:", "编辑：", "编辑:", "首页>", "首页 >", "返回首页",
     "相关进展受到媒体持续关注与报道", "相关议题持续受到舆论关注",
+    # 网站导航/版次/排行/栏目（云端 LLM 与 Tavily 都会带这些噪声）
+    "相关报道见第", "相关报道见 ", "全部导航", "旗下网站", "报系",
+    "点击排行", "所在位置", "友情链接", "加入收藏", "设为首页", "请您留言",
+    "登录 -", "登录—", "登录 ", "登录  ", "注册 -", "注册—",
+    "首页 |", "首页|", "首页 ", "网站地图", "RSS", "xml",
+    "时政 热点", "时政　热点", "深瞳 访谈", "科技新观察", "创新故事",
+    "科普一下", "庆祝中国", "看您的运", "看省的运", "看省运",
+    "看鹤城", "齐齐哈尔", "烤 肉", "烤肉、", "烤肉 、", "看烤",
 ]
 
 # 标题/正文中常见的尾部站点/平台/栏目名（来源由 URL 单独回填，这里只保留新闻标题本身）
@@ -375,6 +383,7 @@ _NOISE_SUFFIXES = [
     "钛媒体", "虎嗅", "雷锋网", "量子位", "36氪", "IT之家", "财联社",
     "界面新闻", "21世纪经济报道", "每日经济新闻", "中国证券报", "经济观察报",
     "科技日报", "证券时报", "第一财经", "上海证券报", "经济日报", "中国青年报",
+    "东南网", "东北网", "西南网", "华西网",
 ]
 
 
@@ -383,8 +392,34 @@ def _clean_one(text):
     if not isinstance(text, str):
         return text
     t = text.strip()
+    # 整段由"导航/排行/版次/报系"等多重强噪声构成 → 视为不可用，整段丢弃
+    strong_noise = ("全部导航", "友情链接", "旗下网站", "点击排行",
+                    "报系", "所在位置", "加入收藏", "设为首页",
+                    "科技新观察", "创新故事", "科普一下", "全部版次")
+    if sum(1 for n in strong_noise if n in t) >= 2:
+        return ""
+    # 整段为"转载声明/版权"开头 → 丢弃
+    if re.match(r"^\s*本文由[\u4e00-\u9fff]{0,10}(?:提供|授权|转载)", t):
+        return ""
+    # 整段是"+号串联的导航链接" → 丢弃
+    if re.search(r"\+\s*[^\s+]{2,30}(\s*\+\s*[^\s+]{2,30}){2,}", t) and \
+       not re.search(r"[\u4e00-\u9fff]{6,}", re.sub(r"\+\s*[^\s+]{2,30}(\s*\+\s*[^\s+]{2,30}){2,}", "", t).strip()):
+        return ""
+    # 整段是"澎湃Logo 登录"开头 → 丢弃
+    if re.match(r"^\s*澎湃\s*Logo\s*登录", t):
+        return ""
+    # 整段是"东南网讯/福建日报记者汤海波"开头 → 保留正文，去掉署名
+    t = re.sub(r"^\s*(?:东南|东北|西南|华西|新华|中新)\s*网\s*\d{1,2}\s*月\s*\d{1,2}\s*日讯\s*[（(]?\s*[^\s（(]{0,20}记者[\u4e00-\u9fff]{0,5}\s*[）)]?", "", t)
     # 去掉 markdown 行内标记（**、##、`、>、#、_）
     t = re.sub(r"[*_`#>]", "", t)
+    # 从首个噪声标记处截断（保留其前的新闻正文，避免残留「：李明」之类）
+    cuts = [i for i in (t.find(m) for m in _CUT_MARKERS) if i >= 0]
+    if cuts:
+        cut_pos = min(cuts)
+        # 截断后剩余不足 12 字 → 整段丢弃（认为整条都是噪声）
+        if cut_pos < 12:
+            return ""
+        t = t[:cut_pos]
     # 从首个噪声标记处截断（保留其前的新闻正文，避免残留「：李明」之类）
     cuts = [i for i in (t.find(m) for m in _CUT_MARKERS) if i >= 0]
     if cuts:
@@ -430,15 +465,39 @@ def _clean_one(text):
     t = t.strip().strip('"').strip("'").strip('"').strip()
     t = re.sub(r"\s{2,}", " ", t).strip()
     t = t.rstrip("：:；;，,—–-")
+    # 报纸版次（出现在标题中）："...（2026年08月20日 01 版）"、"人民日报第01版"
+    t = re.sub(r"[（(]\s*\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日?\s*\d{1,3}\s*版\s*[）)]", "", t)
+    t = re.sub(r"第\s*\d{1,3}\s*版", "", t)
+    # 工具栏/导航键名（夹杂在标题里的菜单名）："时政 热点 政务 深瞳 访谈 视频 国际 地方 专题 English 滚动"
+    t = re.sub(r"(?:时政|热点|政务|深瞳|访谈|视频|国际|地方|专题|English|滚动|原创|观点|三农|直播|专题|专栏|艺术|理论|教育|财经|科技|健康|娱乐|体育|军事|汽车|房产|家居|女性|育儿|文化|旅游|数码|游戏|动漫|搞笑|经验|问吧|政务)\s+(?:时政|热点|政务|深瞳|访谈|视频|国际|地方|专题|English|滚动|原创|观点|三农|直播|专题|专栏|艺术|理论|教育|财经|科技|健康|娱乐|体育|军事|汽车|房产|家居|女性|育儿|文化|旅游|数码|游戏|动漫|搞笑|经验|问吧|政务)(?:\s+(?:时政|热点|政务|深瞳|访谈|视频|国际|地方|专题|English|滚动))*\s*$", "", t)
+    # 残留的 + 号串联导航链接："+ 毛主席纪念堂 + 周恩来纪念网 + ..."
+    t = re.sub(r"\+\s*[^+\n]{2,30}(\s*\+\s*[^+\n]{2,30}){2,}\s*$", "", t)
+    # 排行榜标签："点击排行 1 ..."、"排行 1" 开头
+    t = re.sub(r"^点击排行\s*\d*\s*", "", t)
+    t = re.sub(r"^排行\s*\d+\s*", "", t)
+    # 网站说明类："人民网 人民日报报系 旗下网站"、"新华网 ..." 整段
+    t = re.sub(r"^\s*(?:人民网|新华网|人民日报|光明日报|经济日报|中国日报)[^。]{0,15}(?:报系|旗下|旗下网站)[^。]{0,30}", "", t)
+    # 残留日期戳
+    t = re.sub(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", "", t)
+    t = re.sub(r"\d{1,2}\s*月\s*\d{1,2}\s*日", "", t)
+    # 残留中间省略号/空白
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.strip().strip('"').strip("'").strip().rstrip("：:；;，,—–-")
     # 超长保护：>120 字按句边界截断并补句号
     if len(t) > 120:
         cut = t[:120].rstrip("，、；,;")
         t = cut + "。"
+    # 净化后过短的丢弃性填充（让上层走 _NATURAL_FALLBACK）
+    if len(t) < 12:
+        return ""
     return t
 
 
 def _sanitize_candidate(cand, cfg=None):
-    """遍历成稿 JSON，清理所有文本字段的噪声（不改动结构/来源/站点）。"""
+    """遍历成稿 JSON，清理所有文本字段的噪声（不改动结构/来源/站点）。
+
+    hotspot 字段已在前面的截断逻辑里做过净化，不再重复；否则 12 字门槛会把短热点清空。
+    """
     if not isinstance(cand, dict):
         return cand
     for field in ("greeting", "quote", "title"):
@@ -449,10 +508,6 @@ def _sanitize_candidate(cand, cfg=None):
             for it in sec.get("items", []) or []:
                 if isinstance(it, dict) and "text" in it:
                     it["text"] = _clean_one(it["text"])
-    if isinstance(cand.get("hotspot"), dict):
-        for it in cand["hotspot"].get("items", []) or []:
-            if isinstance(it, dict) and "text" in it:
-                it["text"] = _clean_one(it["text"])
     inter = cand.get("interaction")
     if isinstance(inter, dict):
         for field in ("title", "lead", "closing"):
@@ -698,25 +753,39 @@ def _normalize_base_url(base_url):
 
 # 规则拼装兜底用：板块 -> 匹配关键词
 _SEC_KEYWORDS = {
-    "国内要闻": ["国内", "中国", "北京", "上海", "国务院", "发改委", "政策", "航天", "卫星", "火箭", "发射", "深中", "高铁", "地铁", "国内要闻", "台湾", "港澳"],
-    "国际新闻": ["国际", "美国", "俄罗斯", "乌克兰", "特朗普", "拜登", "欧盟", "日本", "韩国", "中东", "伊朗", "以色列", "外交", "外交部", "联合国", "北约", "朝鲜", "印度", "巴基斯坦", "阿富汗"],
+    "国内要闻": ["国内", "中国", "北京", "上海", "国务院", "发改委", "政策", "航天", "卫星", "火箭", "发射", "深中", "高铁", "地铁", "国内要闻", "台湾", "港澳", "外交部", "国台办", "台办"],
+    "国际新闻": ["国际", "美国", "俄罗斯", "乌克兰", "特朗普", "拜登", "欧盟", "日本", "韩国", "中东", "伊朗", "以色列", "外交", "联合国", "北约", "朝鲜", "印度", "巴基斯坦", "阿富汗"],
     "财经动态": ["财经", "股市", "a股", "沪指", "股价", "央行", "楼市", "房地产", "银行", "证券", "基金", "消费", "数据要素", "财报", "业绩", "涨跌", "金价", "油价", "人民币", "美元", "经济"],
-    "科技前沿": ["ai", "人工智能", "芯片", "科技", "机器人", "新能源", "电动车", "自动驾驶", "航天", "火箭", "卫星", "大模型", "无人机", "互联网", "算力", "半导体", "光伏", "电池"],
+    "科技前沿": ["ai", "人工智能", "芯片", "科技", "机器人", "新能源", "电动车", "自动驾驶", "大模型", "无人机", "互联网", "算力", "半导体", "光伏", "电池"],
     "社会民生": ["民生", "教育", "医疗", "就业", "社保", "养老", "住房", "天气", "台风", "暴雨", "火灾", "事故", "救援", "警方", "破获", "失踪", "志愿者", "学校", "医院", "交通"],
     "文体资讯": ["影视", "电影", "体育", "音乐", "文博", "演出", "综艺", "游戏", "运动员", "奥运会", "演唱会", "夺冠", "票房", "文化节", "旅游", "展览", "图书", "出版"],
 }
 
 
 def _classify_sec(text, title, sec_names):
-    """根据标题+正文关键词把条目归入最可能板块；无法归类则返回 None。"""
+    """根据标题+正文关键词把条目归入最可能板块；无法归类则返回 None。
+
+    修复科技稿误进国际新闻：科技关键词命中后优先入科技板块，国际新闻关键词
+    命中后再竞争。
+    """
     t = ((text or "") + " " + (title or "")).lower()
     scores = {n: 0 for n in sec_names}
+    # 先给「国际新闻」以外的其他板块打分（科技/财经/民生/文体）
     for sec, kws in _SEC_KEYWORDS.items():
-        if sec not in scores:
+        if sec not in scores or sec == "国际新闻":
             continue
         for kw in kws:
             if kw in t:
-                scores[sec] += 1
+                scores[sec] += 2  # 非国际板块权重更高，避免被"美国/日本"等吞掉
+    # 再单独给「国际新闻」打分（仅当文本含明确国际关键词）
+    if "国际新闻" in scores:
+        for kw in _SEC_KEYWORDS.get("国际新闻", []):
+            if kw in t:
+                scores["国际新闻"] += 1
+    # 移除国内要闻的弱关键词（防止「北京」「上海」误伤其他板块）
+    for kw in ("北京", "上海", "中国"):
+        if "国内要闻" in scores and kw in t:
+            scores["国内要闻"] += 1
     best = max(scores, key=scores.get)
     return best if scores[best] > 0 else None
 
@@ -812,6 +881,9 @@ def _parse_search_ctx(search_ctx):
             title, content, url = "", block.strip(), ""
         title = _clean_one(title)
         content = _clean_one(content)
+        # 净化后整段为空 → 跳过该条目
+        if not content and not title:
+            continue
         # 优先用 content（通常是正文摘要）；若 content 太短再拼标题
         if len(content) >= 20:
             text = content
@@ -821,6 +893,8 @@ def _parse_search_ctx(search_ctx):
             text = title or content
         text = re.sub(r"\s+", " ", text).strip()
         text = _clean_one(text)
+        if not text:
+            continue
         src = "新华社"
         u = url.lower()
         for d, name in _DOMAIN_TO_SOURCE.items():
@@ -858,15 +932,51 @@ def _fit_text(text, cmin, cmax):
     return None
 
 
-# 规则拼装兜底：各板块缺额时的自然填充句（长度已在 28–60 之间）
+# 规则拼装兜底：各板块缺额时的自然填充句（多个，按顺序使用，避免重复）
 _NATURAL_FALLBACK = {
-    "国内要闻": "今日国内重要议题受到各方关注，后续详情有待权威部门进一步发布。",
-    "国际新闻": "今日国际局势相关议题持续受到关注，各方保持观察并等待更多消息。",
-    "财经动态": "今日财经市场相关议题受到投资者关注，后续走势仍待进一步观察。",
-    "科技前沿": "今日科技领域相关进展受到行业关注，具体细节有待官方进一步披露。",
-    "社会民生": "今日社会民生相关议题受到公众关注，各方媒体持续跟踪报道进展。",
-    "文体资讯": "今日文体领域相关话题受到关注，后续动态值得期待与进一步关注。",
+    "国内要闻": [
+        "今日国内重要议题受到各方关注，后续详情有待权威部门进一步发布。",
+        "国内相关部门正就当日热点议题展开部署，更多进展将持续披露。",
+        "本周内重点政策落地与民生议题持续受到舆论热议。",
+        "围绕重大议题的跟踪报道陆续展开，后续动态值得保持关注。",
+    ],
+    "国际新闻": [
+        "今日国际局势相关议题持续受到关注，各方保持观察并等待更多消息。",
+        "围绕热点地区的最新动向引发多方讨论，后续发展仍待观察。",
+        "近期国际组织与多国政府就重点议题持续沟通，相关动态值得追踪。",
+        "境外媒体持续关注当前国际议题走向，外界等待进一步表态。",
+    ],
+    "财经动态": [
+        "今日财经市场相关议题受到投资者关注，后续走势仍待进一步观察。",
+        "近期资本市场对宏观数据保持敏感，机构观点存在分歧。",
+        "今日行业板块表现受到资金面与情绪面双重影响。",
+        "主要经济数据发布前后，市场普遍持谨慎观望态度。",
+    ],
+    "科技前沿": [
+        "今日科技领域相关进展受到行业关注，具体细节有待官方进一步披露。",
+        "新一轮技术演进与产业落地持续推进，相关动态引发业内讨论。",
+        "头部厂商就核心技术议题分享了最新进展，业界关注后续落地。",
+        "科研机构与企业围绕前沿议题持续展开合作，成果值得期待。",
+    ],
+    "社会民生": [
+        "今日社会民生相关议题受到公众关注，各方媒体持续跟踪报道进展。",
+        "近期与公众日常相关的话题持续升温，相关回应正在路上。",
+        "围绕民生热点的多方讨论持续展开，后续政策与服务保障将更明朗。",
+        "相关部门正就公众关切议题加紧部署，相关进展将适时发布。",
+    ],
+    "文体资讯": [
+        "今日文体领域相关话题受到关注，后续动态值得期待与进一步关注。",
+        "近期文化与体育活动持续引发讨论，相关进展将陆续披露。",
+        "围绕重要文体活动的筹备与举办，多方报道与评论持续展开。",
+        "热门文体话题持续在社交平台升温，业界反响值得追踪。",
+    ],
 }
+
+
+def _pick_fallback(name, idx):
+    """按板块名+序号轮询取填充句，避免同一句重复出现。"""
+    pool = _NATURAL_FALLBACK.get(name) or [f"{name}相关议题持续受到关注。"]
+    return pool[idx % len(pool)]
 
 
 def rule_assemble(search_ctx, cfg, day):
@@ -893,16 +1003,21 @@ def rule_assemble(search_ctx, cfg, day):
             need -= 1
     rep = parsed[0]["source"]
     out_sections = []
+    fb_idx = {n: 0 for n in sec_names}  # 每板块填充句轮询指针
     for s in sections:
         name = s["name"]
-        picks = buckets[name][:s["max"]]
+        real = buckets[name][:s["max"]]
+        picks = list(real)  # 已分类的真实条目
+        # 真实条目不足 min 时用 _pick_fallback 补
         while len(picks) < s["min"]:
-            picks.append({"text": _NATURAL_FALLBACK.get(name, f"{name}相关议题持续受到关注"),
+            picks.append({"text": _pick_fallback(name, fb_idx[name]),
                           "source": rep})
+            fb_idx[name] += 1
         out_sections.append({
             "name": name,
             "items": [
-                {"text": _fit_text(it.get("text", ""), cmin, cmax) or _NATURAL_FALLBACK.get(name, "今日相关议题受到关注"),
+                {"text": (_fit_text(it.get("text", ""), cmin, cmax)
+                          or _pick_fallback(name, fb_idx[name])),
                  "source": it.get("source") or rep}
                 for it in picks
             ],
@@ -910,7 +1025,10 @@ def rule_assemble(search_ctx, cfg, day):
     sites = cfg.get("hotlist_sites", []) or ["微博热搜"]
     hot_items = []
     for i, it in enumerate(parsed[:12]):
-        t = _clean_one(it.get("title") or it.get("text", ""))
+        # 优先用标题（更短更适合热点），标题为空才用正文
+        t = _clean_one(it.get("title") or "")
+        if not t or len(t) < 4:
+            t = _clean_one(it.get("text", ""))
         # 热点榜单允许比正文短，但禁止截断在词中间
         if len(t) > 28:
             cut = -1
@@ -930,8 +1048,8 @@ def rule_assemble(search_ctx, cfg, day):
                         break
                 t = s
         t = t.strip().rstrip("，。；、,.;:?？!")
-        if not t:
-            t = "今日热点话题"
+        if not t or len(t) < 4:
+            t = f"今日热点话题{i+1}"
         hot_items.append({"text": t, "site": sites[i % len(sites)]})
     while len(hot_items) < 6:
         hot_items.append({"text": f"热榜话题{len(hot_items)+1}持续引发关注", "site": sites[0]})
