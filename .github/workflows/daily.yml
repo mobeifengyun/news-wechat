@@ -170,7 +170,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$(pwd)"
           git config pull.rebase true
-          git add news_wechat/output news_wechat/mobile_dist
+          # 只提交 output（跨期查重与历史归档需要）；mobile_dist 由 GitHub Pages 单独部署，不必进 main
+          git add news_wechat/output
           if git diff --cached --quiet; then
             echo "无产出变更，跳过提交"
             exit 0
