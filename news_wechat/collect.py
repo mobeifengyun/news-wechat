@@ -739,7 +739,8 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     sites = "、".join(cfg["hotlist_sites"])
     sys_p = (
         "你是中文新闻编辑。负责生成日报的「热点榜单」与「每日一问」两个板块，严格遵守：\n"
-        "1. hotspot 每条只写话题标题（简短，≤20字），site 只能是给定热榜站点之一。\n"
+        "1. hotspot 必须输出 6-12 条（下限 6 条，绝不能少），"
+        "每条只写话题标题（简短，≤20字），site 只能是给定热榜站点之一。\n"
         "2. interaction 每期只出 1 个高质量问题，靠读者打字留言参与，"
         "绝不做成按钮、绝不允许出现「点赞/在看/转发/分享/抽奖/奖品」等词。\n"
         "3. 只输出 JSON，不要解释。\n"
@@ -755,9 +756,16 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"topic 要有钩子（如 ask「您手机里最常用的是哪个 APP？评论区聊聊」）。\n"
         f"检索素材（仅供参考选题方向）：\n"
         + ("\n\n".join(search_ctx)[:2000] if search_ctx else "（无素材）")
-        + "\n\n输出 schema：\n"
+        + "\n\n输出 schema（hotspot items 必须 6-12 条，示例给出 6 条，site 只能从给定站点选）：\n"
         "{\n"
-        '  "hotspot": {"name": "热点榜单", "items": [{"text": "话题标题", "site": "微博热搜"}]},\n'
+        '  "hotspot": {"name": "热点榜单", "items": [\n'
+        '    {"text": "话题标题1", "site": "微博热搜"},\n'
+        '    {"text": "话题标题2", "site": "百度热搜"},\n'
+        '    {"text": "话题标题3", "site": "抖音热榜"},\n'
+        '    {"text": "话题标题4", "site": "微博热搜"},\n'
+        '    {"text": "话题标题5", "site": "今日头条"},\n'
+        '    {"text": "话题标题6", "site": "知乎热榜"}\n'
+        '  ]},\n'
         '  "interaction": {"title": "今日一问", "lead": "引导语≤30字",\n'
         '    "card": {"type": "ask", "topic": "...", "hint": "..."}, "closing": "收尾≤20字"}\n'
         "}\n"
