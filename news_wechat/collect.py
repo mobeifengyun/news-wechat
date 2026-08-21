@@ -415,10 +415,84 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
     return content
 
 
+# ---------------- 速率限制（应对免费模型低 RPM 限流） ----------------
+import threading as _threading
+_rpm_lock = _threading.Lock()
+_rpm_history = {}      # host -> [timestamp, ...] 最近 60s 内的请求时刻
+_detected_rpm = {}     # host -> 从 429 响应里学到的 RPM 上限
+
+
+def _host_of(url):
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc or url
+    except Exception:
+        return url
+
+
+def _rate_limit_sleep(url):
+    """按 LLM_RPM（或本运行从 429 学到的上限）在调用前节流，避免触发 429。
+
+    免费模型常只有 3 RPM，多板块逐个调用会瞬间打满。调用前先等够间隔，
+    把请求铺到 60 秒窗口内，绝大多数 429 在源头就被消除。
+    """
+    rpm = int(os.environ.get("LLM_RPM", "0") or 0)
+    if rpm <= 0:
+        rpm = _detected_rpm.get(_host_of(url), 0)
+    if rpm <= 0:
+        return
+    interval = 60.0 / rpm
+    host = _host_of(url)
+    with _rpm_lock:
+        now = time.time()
+        hist = [t for t in _rpm_history.get(host, []) if now - t < 60]
+        if len(hist) >= rpm:
+            wait = interval - (now - hist[0]) + 0.5
+            if wait > 0:
+                print(f"  ⏳ 节流 RPM={rpm}：等待 {wait:.1f}s")
+                time.sleep(wait)
+                now = time.time()
+        hist.append(now)
+        _rpm_history[host] = [t for t in hist if now - t < 60]
+
+
+def _parse_429_wait(r):
+    """从 429 响应解析应等待秒数，并顺带学习 RPM 上限。返回等待秒数。"""
+    host = _host_of(getattr(r, "url", "") or "")
+    wait = 0.0
+    ra = getattr(r, "headers", {}).get("Retry-After")
+    if ra:
+        try:
+            wait = float(ra)
+        except Exception:
+            pass
+    body = ""
+    try:
+        body = (r.text or "")
+    except Exception:
+        pass
+    m = re.search(r"max RPM:\s*(\d+)", body, re.I)
+    if m:
+        _detected_rpm[host] = int(m.group(1))
+        print(f"  ℹ 从 429 学到 RPM 上限={_detected_rpm[host]}，后续自动节流")
+    m2 = re.search(r"after\s+(\d+(?:\.\d+)?)\s+seconds?", body, re.I)
+    if m2:
+        wait = max(wait, float(m2.group(1)))
+    if wait <= 0:
+        wait = 20  # 兜底：免费档通常 20-60s 恢复
+    return wait
+
+
 # ---------------- Kimi / Moonshot 联网搜索 ----------------
-def _post_with_retry(url, headers, data, timeout=60, max_retry=1):
-    """带 429 限流退避的 POST。timeout 默认 30s，避免跨国慢节点把整个 workflow 卡死。"""
+def _post_with_retry(url, headers, data, timeout=60, max_retry=4):
+    """带 429 限流退避的 POST。
+
+    免费模型常有极低 RPM（如 3 次/分钟），多板块逐个调用会触发 429。
+    策略：调用前按 RPM 主动节流；遇到 429 解析 Retry-After/响应里的等待秒数退避重试，
+    仍失败才返回响应让上层走供应商替补/兜底（而不是无限重试拖垮整轮）。
+    """
     import requests
+    _rate_limit_sleep(url)
     for i in range(max_retry):
         try:
             print(f"    → POST {url} ({len(data)} bytes, timeout={timeout}s)")
@@ -432,8 +506,12 @@ def _post_with_retry(url, headers, data, timeout=60, max_retry=1):
                 continue
             raise
         if r.status_code == 429:
-            # 免费模型限流：重试无意义，反而会拖长兜底启用时间，直接失败走降级
-            print(f"  ⚠ 429 限流，立即失败（不重试，直接走下一供应商/兜底）")
+            wait = _parse_429_wait(r)
+            if i < max_retry - 1:
+                print(f"  ⚠ 429 限流，等待 {wait:.1f}s 后重试 ({i+1}/{max_retry})")
+                time.sleep(wait)
+                continue
+            print(f"  ⚠ 429 限流耗尽重试次数，交给上层兜底")
             return r
         return r
     return r
