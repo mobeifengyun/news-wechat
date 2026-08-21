@@ -276,6 +276,15 @@ def prev_card_type(day):
 
 
 # ---------------- 检索 ----------------
+def _source_from_url(url):
+    """把检索结果的 url 反查为白名单规范来源名（素材预处理用）。"""
+    u = (url or "").lower()
+    for d, name in _DOMAIN_TO_SOURCE.items():
+        if d in u:
+            return name
+    return ""
+
+
 def tavily_search(query, api_key, max_results=5, days=2):
     import requests
     r = requests.post(
@@ -296,7 +305,13 @@ def tavily_search(query, api_key, max_results=5, days=2):
     res = r.json().get("results", [])
     out = []
     for it in res:
-        out.append(f"【{it.get('title','')}】{it.get('content','')}\n来源: {it.get('url','')}")
+        title = it.get("title", "")
+        content = it.get("content", "")
+        url = it.get("url", "")
+        # 素材预处理：把原始 url 直接归一化为白名单规范来源名，
+        # 模型拿到的素材即带规范来源，从根上减少来源归属混乱。
+        src = _source_from_url(url) or url
+        out.append(f"【{title}】{content}\n来源: {src}")
     return out
 
 
@@ -588,6 +603,257 @@ def _sanitize_candidate(cand, cfg=None):
     return cand
 
 
+# ---------------- 单板块聚焦生成（系统性约束：来源编号化 + 聚焦） ----------------
+def _ctx_for_section(search_ctx, sec_name, sec_names):
+    """从检索素材里筛出与本板块相关的条目（按关键词归类），真正聚焦：
+
+    本板块命中的素材优先；不足 6 条时再用其他素材补足到 6 条，避免给模型喂全量素材
+    （既超出上下文又容易跨板块串味）。命中文档越多，越聚焦。
+    """
+    if not search_ctx:
+        return []
+    picked, rest = [], []
+    for block in search_ctx:
+        if _classify_sec(block, "", sec_names) == sec_name:
+            picked.append(block)
+        else:
+            rest.append(block)
+    keep = picked + rest[:max(0, 6 - len(picked))]
+    return keep
+
+
+def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seed=""):
+    """单板块聚焦 prompt：只让模型生成「一个板块」的 items，来源用编号表约束。"""
+    d = date.fromisoformat(day)
+    date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
+    srcs = sec.get("sources") or cfg["source_whitelist"]
+    src_list = "\n".join(f"    {i}. {name}" for i, name in enumerate(srcs))
+    sys_p = (
+        "你是中文新闻编辑。只负责输出一个新闻板块的若干条摘要，严格遵守：\n"
+        "1. 每条 text 为 20–60 个汉字的客观陈述句，不评论不引申；"
+        "不足 20 字必须补充时间/地点/主体/影响等真实细节扩写。\n"
+        "2. 每条 source_idx 必须是下面「来源编号表」中的某个序号（整数），不可写表外的媒体。\n"
+        "3. 所有新闻须为 " + date_cn + " 当天或前一日真实发生的新近新闻，不用旧闻/周年/历史回顾。\n"
+        "4. 只输出 JSON，不要任何解释文字。\n"
+        "来源编号表：\n" + src_list + "\n"
+    )
+    usr_p = (
+        f"请生成「{sec['name']}」板块，共 {sec['min']}-{sec['max']} 条，"
+        f"按重要等级从高到低排序，且**必须凑够 {sec['min']} 条下限**"
+        f"（不足时用同板块次重要但真实的当天新闻补足，绝不低于下限、绝不用旧闻编造）。\n\n"
+        f"本板块可用的检索素材（仅可据此成稿）：\n"
+        + ("\n\n".join(ctx_for_sec)[:3500] if ctx_for_sec
+           else "（无检索素材，请基于常识输出当天该领域真实可信的概括性新闻，来源须选自编号表）")
+        + "\n\n"
+        f"输出 schema（严格照此）：\n"
+        "{\n"
+        '  "items": [\n'
+        '    {"text": "20-60字摘要", "source_idx": 0},\n'
+        '    {"text": "...", "source_idx": 1}\n'
+        "  ]\n"
+        "}\n"
+    )
+    if errors:
+        usr_p += (
+            "\n上一次未通过校验，请修正：\n- " + "\n- ".join(errors) +
+            "\n修正：①字数不足就补充真实细节扩写到20字以上；"
+            "②source_idx 必须取上面编号表中的序号（整数），不得写表外媒体名。"
+        )
+    return sys_p, usr_p
+
+
+def _extract_section_items(raw, srcs):
+    """从单板块 JSON 提取 items，把 source_idx（整数）映射回规范来源名。"""
+    if not isinstance(raw, str):
+        return []
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        raw = m.group(0)
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(obj, dict):
+        return []
+    items = obj.get("items", []) or []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        t = _clean_one(it.get("text", ""))
+        if not t:
+            continue
+        idx = it.get("source_idx")
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = 0
+        src = srcs[idx] if 0 <= idx < len(srcs) else srcs[0]
+        out.append({"text": t, "source": src})
+    return out
+
+
+def _validate_section(items, sec, cfg):
+    """单板块校验，返回 errors 列表（空表表示通过）。"""
+    errs = []
+    cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
+    srcs = set(sec.get("sources") or cfg["source_whitelist"])
+    if not (sec["min"] <= len(items) <= sec["max"]):
+        errs.append(f"条数 {len(items)} 不在 {sec['min']}-{sec['max']}")
+    for i, it in enumerate(items, 1):
+        t = it.get("text", "")
+        n = len(t)
+        if not (cmin <= n <= cmax):
+            errs.append(f"第{i}条字数 {n}（要求 {cmin}-{cmax}），须补充真实细节扩写到 {cmin} 字以上")
+        if _norm_source_name(it.get("source", "")) not in srcs:
+            errs.append(f"第{i}条来源「{it.get('source')}」不在本板块限定来源")
+    return errs
+
+
+def _section_fallback(sec, search_ctx, cfg):
+    """板块级兜底：复用该板块真实检索条目，不足用填充句补足（不依赖主 LLM）。"""
+    cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
+    srcs = sec.get("sources") or cfg["source_whitelist"]
+    parsed = _parse_search_ctx(search_ctx)
+    sec_names = [s["name"] for s in cfg["sections"]]
+    real = [it for it in parsed
+            if _classify_sec(it.get("text", ""), it.get("title", ""), sec_names) == sec["name"]]
+    picks, fb_idx = [], 0
+    for it in real[:sec["max"]]:
+        src = _norm_source_name(it.get("source", ""))
+        if src not in set(srcs):
+            src = srcs[0]
+        fitted = _fit_text(it.get("text", ""), cmin, cmax)
+        if fitted and not _is_meaningless(fitted):
+            picks.append({"text": fitted, "source": src})
+    while len(picks) < sec["min"]:
+        picks.append({"text": _pick_fallback(sec["name"], fb_idx), "source": srcs[0]})
+        fb_idx += 1
+    return picks[:sec["max"]]
+
+
+def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
+    """生成热点榜单 + 每日一问（独立聚焦 prompt）。"""
+    d = date.fromisoformat(day)
+    date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
+    sites = "、".join(cfg["hotlist_sites"])
+    sys_p = (
+        "你是中文新闻编辑。负责生成日报的「热点榜单」与「每日一问」两个板块，严格遵守：\n"
+        "1. hotspot 每条只写话题标题（简短，≤20字），site 只能是给定热榜站点之一。\n"
+        "2. interaction 每期只出 1 个高质量问题，靠读者打字留言参与，"
+        "绝不做成按钮、绝不允许出现「点赞/在看/转发/分享/抽奖/奖品」等词。\n"
+        "3. 只输出 JSON，不要解释。\n"
+    )
+    usr_p = (
+        f"请生成 {day}（{date_cn}）的热点榜单与每日一问。\n"
+        f"热点榜单站点（site 只能取这些）：{sites}。\n"
+        f"上一期互动卡型是「{prev_type or '无'}」，本期必须换一种卡型"
+        f"（可选：guess/code/fill/echo/stance/ask）。\n"
+        f"今日一问选题方向：贴近30-40岁城市读者日常"
+        f"（工作通勤/家庭/消费数码/兴趣解压/天气），"
+        f"严禁时政外交、军事、灾情伤亡、政策抱怨、荐股、医疗建议、性别地域对立等易翻车话题；"
+        f"topic 要有钩子（如 ask「您手机里最常用的是哪个 APP？评论区聊聊」）。\n"
+        f"检索素材（仅供参考选题方向）：\n"
+        + ("\n\n".join(search_ctx)[:2000] if search_ctx else "（无素材）")
+        + "\n\n输出 schema：\n"
+        "{\n"
+        '  "hotspot": {"name": "热点榜单", "items": [{"text": "话题标题", "site": "微博热搜"}]},\n'
+        '  "interaction": {"title": "今日一问", "lead": "引导语≤30字",\n'
+        '    "card": {"type": "ask", "topic": "...", "hint": "..."}, "closing": "收尾≤20字"}\n'
+        "}\n"
+    )
+    if errors:
+        usr_p += "\n上一次未通过校验：\n- " + "\n- ".join(errors)
+    return sys_p, usr_p
+
+
+def _extract_meta(raw, cfg):
+    """从 meta JSON 提取 hotspot + interaction，并净化文本。"""
+    if not isinstance(raw, str):
+        return None
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        raw = m.group(0)
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    hot = obj.get("hotspot") or {}
+    hi = []
+    for it in hot.get("items", []) or []:
+        if not isinstance(it, dict):
+            continue
+        t = _clean_one(it.get("text", ""))
+        if t:
+            hi.append({"text": t, "site": it.get("site", cfg["hotlist_sites"][0])})
+    inter = obj.get("interaction") or {}
+    if isinstance(inter, dict):
+        for f in ("title", "lead", "closing"):
+            if f in inter and isinstance(inter[f], str):
+                inter[f] = _clean_one(inter[f])
+        card = inter.get("card")
+        if isinstance(card, dict):
+            for f in ("topic", "template", "hint", "answer", "note"):
+                if f in card and isinstance(card[f], str):
+                    card[f] = _clean_one(card[f])
+    return {"hotspot": {"name": hot.get("name", "热点榜单"), "items": hi},
+            "interaction": inter}
+
+
+def _validate_meta(meta, cfg):
+    """meta 校验，返回 errors 列表。"""
+    errs = []
+    hot = (meta or {}).get("hotspot") or {}
+    hi = hot.get("items", [])
+    if not (6 <= len(hi) <= 12):
+        errs.append(f"[热点榜单] 条数 {len(hi)} 不在 6-12")
+    sites = set(cfg.get("hotlist_sites", []))
+    for i, it in enumerate(hi, 1):
+        if it.get("site", "") not in sites:
+            errs.append(f"[热点榜单] 第{i}条 site 不在热榜站点")
+        if not it.get("text"):
+            errs.append(f"[热点榜单] 第{i}条为空")
+    inter = (meta or {}).get("interaction") or {}
+    card = inter.get("card")
+    if not card:
+        errs.append("[互动] 缺少 card")
+    else:
+        t = card.get("type")
+        if t not in ("guess", "code", "fill", "echo", "stance", "ask"):
+            errs.append(f"[互动] 卡型「{t}」非法")
+        else:
+            if not card.get("topic"):
+                errs.append(f"[互动·{t}] 缺 topic")
+            if t == "guess" and not card.get("unit"):
+                errs.append("[互动·guess] 缺 unit")
+            if t == "code" and (not card.get("format") or not card.get("example")):
+                errs.append("[互动·code] 缺 format/example")
+            if t == "fill" and not card.get("template"):
+                errs.append("[互动·fill] 缺 template")
+            if t == "stance" and (not card.get("left") or not card.get("right")):
+                errs.append("[互动·stance] 缺 left/right")
+            if t == "echo" and not card.get("answer"):
+                errs.append("[互动·echo] 缺 answer")
+    return errs
+
+
+def _meta_fallback(cfg, day):
+    """热点/互动兜底。"""
+    sites = cfg.get("hotlist_sites", []) or ["微博热搜"]
+    hot_items = [{"text": f"热榜话题{i+1}持续引发关注", "site": sites[0]} for i in range(6)]
+    interaction = {
+        "title": "今日一问",
+        "lead": "朋友，今天咱们聊点轻松的。",
+        "card": {"type": "ask",
+                 "topic": "您平时早上喜欢喝豆浆还是牛奶？评论区聊聊您的习惯。",
+                 "hint": "欢迎在评论区分享您的日常。"},
+        "closing": "期待您的留言～",
+    }
+    return {"hotspot": {"name": "热点榜单", "items": hot_items}, "interaction": interaction}
+
+
 # ---------------- 校验 ----------------
 def validate(data, cfg):
     errors = []
@@ -856,12 +1122,12 @@ def _normalize_base_url(base_url):
 
 # 规则拼装兜底用：板块 -> 匹配关键词
 _SEC_KEYWORDS = {
-    "国内要闻": ["国内", "中国", "北京", "上海", "国务院", "发改委", "政策", "航天", "卫星", "火箭", "发射", "深中", "高铁", "地铁", "国内要闻", "台湾", "港澳", "外交部", "国台办", "台办"],
-    "国际新闻": ["国际", "美国", "俄罗斯", "乌克兰", "特朗普", "拜登", "欧盟", "日本", "韩国", "中东", "伊朗", "以色列", "外交", "联合国", "北约", "朝鲜", "印度", "巴基斯坦", "阿富汗"],
-    "财经动态": ["财经", "股市", "a股", "沪指", "股价", "央行", "楼市", "房地产", "银行", "证券", "基金", "消费", "数据要素", "财报", "业绩", "涨跌", "金价", "油价", "人民币", "美元", "经济"],
-    "科技前沿": ["ai", "人工智能", "芯片", "科技", "机器人", "新能源", "电动车", "自动驾驶", "大模型", "无人机", "互联网", "算力", "半导体", "光伏", "电池"],
-    "社会民生": ["民生", "教育", "医疗", "就业", "社保", "养老", "住房", "天气", "台风", "暴雨", "火灾", "事故", "救援", "警方", "破获", "失踪", "志愿者", "学校", "医院", "交通"],
-    "文体资讯": ["影视", "电影", "体育", "音乐", "文博", "演出", "综艺", "游戏", "运动员", "奥运会", "演唱会", "夺冠", "票房", "文化节", "旅游", "展览", "图书", "出版"],
+    "国内要闻": ["国内", "中国", "北京", "上海", "国务院", "发改委", "政策", "航天", "卫星", "火箭", "发射", "深中", "高铁", "地铁", "国内要闻", "台湾", "港澳", "外交部", "国台办", "台办", "财政", "降准", "改革", "乡村振兴"],
+    "国际新闻": ["国际", "美国", "俄罗斯", "乌克兰", "特朗普", "拜登", "欧盟", "日本", "韩国", "中东", "伊朗", "以色列", "外交", "联合国", "北约", "朝鲜", "印度", "巴基斯坦", "阿富汗", "美股", "美债", "美联储", "欧洲", "贸易", "关税", "英国", "法国", "德国"],
+    "财经动态": ["财经", "股市", "a股", "沪指", "股价", "央行", "楼市", "房地产", "银行", "证券", "基金", "消费", "数据要素", "财报", "业绩", "涨跌", "金价", "油价", "人民币", "美元", "经济", "降准", "加息", "gdp", "营收", "净利润", "理财"],
+    "科技前沿": ["ai", "人工智能", "芯片", "科技", "机器人", "新能源", "电动车", "自动驾驶", "大模型", "无人机", "互联网", "算力", "半导体", "光伏", "电池", "航天", "卫星", "发射", "量子", "生物医药"],
+    "社会民生": ["民生", "教育", "医疗", "就业", "社保", "养老", "住房", "天气", "台风", "暴雨", "火灾", "事故", "救援", "警方", "破获", "失踪", "志愿者", "学校", "医院", "交通", "高考", "考研", "生育"],
+    "文体资讯": ["影视", "电影", "体育", "音乐", "文博", "演出", "综艺", "游戏", "运动员", "奥运会", "演唱会", "夺冠", "票房", "文化节", "旅游", "展览", "图书", "出版", "电视剧", "球赛"],
 }
 
 
@@ -1314,64 +1580,104 @@ def main():
     data = None
     last_err = ""
     last_raw = ""
+    sec_names = [s["name"] for s in cfg["sections"]]
+
+    # -------- 系统性重构：逐板块聚焦生成（来源编号化，结构上消灭越界） --------
+    sections_out = []
+    for s in cfg["sections"]:
+        srcs = s.get("sources") or cfg["source_whitelist"]
+        ctx = _ctx_for_section(search_ctx, s["name"], sec_names)
+        sec_items = None
+        sec_errs = []
+        for provider in providers:
+            print(f"\n▶ [{s['name']}] 尝试 {provider['name']}")
+            try:
+                for attempt in range(2):
+                    sys_p, usr_p = build_section_prompt(s, day, cfg, ctx, sec_errs, seed)
+                    print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
+                    try:
+                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                        last_raw = raw
+                        cand_items = _extract_section_items(raw, srcs)
+                        sec_errs = _validate_section(cand_items, s, cfg)
+                        if sec_errs:
+                            print("  校验未过：", sec_errs[0])
+                            continue
+                        sec_items = cand_items
+                        break
+                    except LLMAuthError as e:
+                        print("  ⛔", e)
+                        break  # 该供应商鉴权失败，跳到下一个供应商
+                    except Exception as e:
+                        last_err = str(e)
+                        print("  解析失败:", e)
+                        sec_errs = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
+                        continue
+            except LLMAuthError:
+                continue
+            if sec_items:
+                break
+        if not sec_items:
+            print(f"⚠ [{s['name']}] 大模型失败，使用板块级兜底")
+            sec_items = _section_fallback(s, search_ctx, cfg)
+        print(f"✅ [{s['name']}] 成稿 {len(sec_items)} 条")
+        sections_out.append({"name": s["name"], "items": sec_items})
+
+    # -------- meta：热点榜单 + 每日一问（独立聚焦 prompt） --------
+    meta = None
+    meta_errs = []
     for provider in providers:
-        print(f"\n▶ 尝试 {provider['name']}（候选模型 {len(provider['models'])} 个）")
+        print(f"\n▶ [热点/互动] 尝试 {provider['name']}")
         try:
-            for attempt in range(3):
-                sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, errors, seed)
+            for attempt in range(2):
+                sys_p, usr_p = build_meta_prompt(day, cfg, prev_type, search_ctx, meta_errs, seed)
                 print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                 try:
                     raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
                     last_raw = raw
-                    m = re.search(r"\{.*\}", raw, re.S)
-                    if m:
-                        raw = m.group(0)
-                    cand = json.loads(raw)
-                    if not isinstance(cand, dict):
-                        raise ValueError(f"模型返回的是 {type(cand).__name__}，必须返回 JSON 对象")
-                    cand = _sanitize_candidate(cand, cfg)
-                    if cand is None:
-                        raise ValueError("净化后成稿为空")
+                    cand_meta = _extract_meta(raw, cfg)
+                    meta_errs = _validate_meta(cand_meta, cfg)
+                    if meta_errs:
+                        print("  校验未过：", meta_errs[0])
+                        continue
+                    meta = cand_meta
+                    break
                 except LLMAuthError as e:
                     print("  ⛔", e)
-                    break  # 该供应商鉴权失败，跳到下一个供应商
+                    break
                 except Exception as e:
                     last_err = str(e)
                     print("  解析失败:", e)
-                    errors = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
+                    meta_errs = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
                     continue
-
-                errors = validate(cand, cfg)
-                if errors:
-                    print("  校验未过：", errors[0])
-                    continue
-                if audit_block(cand, day) > 0:
-                    errors = ["内容触发合规 BLOCK，请改用更中性的表述后重试"]
-                    print("  合规 BLOCK，重试")
-                    continue
-                data = cand
-                break
         except LLMAuthError:
             continue
-        if data:
-            print(f"✅ {provider['name']} 成稿成功")
+        if meta:
             break
+    if not meta:
+        print("⚠ [热点/互动] 大模型失败，使用兜底")
+        meta = _meta_fallback(cfg, day)
 
-    # 第四级：所有 LLM 供应商均失败 → Tavily 规则拼装兜底（无 AI 润色）
-    if not data:
-        print("\n⚠ 所有 LLM 供应商均失败，启用 Tavily 规则拼装兜底")
+    data = {
+        "greeting": f"{day} 早安，来看看今天值得知道的事。",
+        "quote": "平凡的一天，也能过得有滋有味。",
+        "sections": sections_out,
+        "hotspot": meta["hotspot"],
+        "interaction": meta["interaction"],
+    }
+    data = _sanitize_candidate(data, cfg)
+
+    # 最终总校验保险：仍不合规则整体走 Tavily 规则拼装兜底
+    final_errs = validate(data, cfg)
+    if final_errs:
+        print("⚠ 整体校验仍有问题，尝试 Tavily 规则拼装整体兜底：", final_errs[:3])
         try:
-            data = rule_assemble(search_ctx, cfg, day)
-            if data:
-                data = _sanitize_candidate(data, cfg)
-                errs = validate(data, cfg)
-                if errs:
-                    print("  规则拼装未通过校验:", errs[:3])
-                    data = None
-                else:
+            fb = rule_assemble(search_ctx, cfg, day)
+            if fb:
+                fb = _sanitize_candidate(fb, cfg)
+                if validate(fb, cfg) == []:
+                    data = fb
                     print("✅ 规则拼装兜底成稿成功")
-            else:
-                print("  规则拼装无可用检索结果")
         except Exception as e:
             print("  规则拼装异常:", e)
 
