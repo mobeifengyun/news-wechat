@@ -415,7 +415,7 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
 
 
 # ---------------- Kimi / Moonshot 联网搜索 ----------------
-def _post_with_retry(url, headers, data, timeout=90, max_retry=1):
+def _post_with_retry(url, headers, data, timeout=60, max_retry=1):
     """带 429 限流退避的 POST。timeout 默认 30s，避免跨国慢节点把整个 workflow 卡死。"""
     import requests
     for i in range(max_retry):
@@ -1840,52 +1840,60 @@ def main():
     last_raw = ""
     sec_names = [s["name"] for s in cfg["sections"]]
 
-    # -------- 第一层：整体生成（内容更完整连贯；约束由代码后处理修正） --------
-    for provider in providers:
-        print(f"\n▶ [整体生成] 尝试 {provider['name']}")
-        try:
-            for attempt in range(2):
-                sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, [], seed)
-                print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
-                try:
-                    raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
-                    last_raw = raw
-                    m = re.search(r"\{.*\}", raw, re.S)
-                    if m:
-                        raw = m.group(0)
-                    cand = json.loads(raw)
-                    if not isinstance(cand, dict):
-                        raise ValueError(f"模型返回的是 {type(cand).__name__}，必须返回 JSON 对象")
-                    cand = _sanitize_candidate(cand, cfg)
-                    if cand is None:
-                        raise ValueError("净化后成稿为空")
-                    cand = _postprocess_whole(cand, cfg, search_ctx, provider)
-                    if cand is None:
-                        raise ValueError("后处理后成稿为空")
-                except LLMAuthError as e:
-                    print("  ⛔", e)
+    # -------- 主路径说明：单板块聚焦生成（见下方 if not data 块）--------
+    # 原「整体生成优先」经验证缺陷明显：产出偏短(~3350字)、来源归一化后全退化成
+    # 「新华社」、空话/图注残留；且整体生成 validate 失败会掉入逐板块长耗时生成
+    # （每块多次 90s LLM 调用），累计逼近 15 分钟超时使整轮失败。
+    # 故默认不跑整体生成，主路径改为单板块聚焦（来源编号化、跨板块去重、字数扩写、
+    # 失败即 Tavily 真实条目兜底），稳定可控。整体生成代码保留，设 WHOLE_GEN=1 可启用。
+    data = None
+    if os.environ.get("WHOLE_GEN") == "1":
+        for provider in providers:
+            print(f"\n▶ [整体生成] 尝试 {provider['name']}")
+            try:
+                for attempt in range(2):
+                    sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, [], seed)
+                    print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
+                    try:
+                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                        last_raw = raw
+                        m = re.search(r"\{.*\}", raw, re.S)
+                        if m:
+                            raw = m.group(0)
+                        cand = json.loads(raw)
+                        if not isinstance(cand, dict):
+                            raise ValueError(f"模型返回的是 {type(cand).__name__}，必须返回 JSON 对象")
+                        cand = _sanitize_candidate(cand, cfg)
+                        if cand is None:
+                            raise ValueError("净化后成稿为空")
+                        cand = _postprocess_whole(cand, cfg,  # noqa
+                                                  search_ctx, provider)
+                        if cand is None:
+                            raise ValueError("后处理后成稿为空")
+                    except LLMAuthError as e:
+                        print("  ⛔", e)
+                        break
+                    except Exception as e:
+                        last_err = str(e)
+                        print("  解析失败:", e)
+                        continue
+
+                    errs = validate(cand, cfg)
+                    if errs:
+                        print("  校验未过：", errs[0])
+                        continue
+                    if audit_block(cand, day) > 0:
+                        print("  合规 BLOCK，重试")
+                        continue
+                    data = cand
                     break
-                except Exception as e:
-                    last_err = str(e)
-                    print("  解析失败:", e)
-                    continue
-
-                errs = validate(cand, cfg)
-                if errs:
-                    print("  校验未过：", errs[0])
-                    continue
-                if audit_block(cand, day) > 0:
-                    print("  合规 BLOCK，重试")
-                    continue
-                data = cand
+            except LLMAuthError:
+                continue
+            if data:
+                print("✅ [整体生成] 成稿成功")
                 break
-        except LLMAuthError:
-            continue
-        if data:
-            print("✅ [整体生成] 成稿成功")
-            break
 
-    # -------- 第二层：单板块聚焦生成（整体失败时降级使用） --------
+    # -------- 主路径：单板块聚焦生成（来源编号化，质量可控、速度快）--------
     if not data:
         sections_out = []
         seen_texts = []
@@ -1897,13 +1905,14 @@ def main():
             for provider in providers:
                 print(f"\n▶ [{s['name']}] 尝试 {provider['name']}")
                 try:
-                    for attempt in range(2):
+                    for attempt in range(1):
                         sys_p, usr_p = build_section_prompt(s, day, cfg, ctx, sec_errs, seen_texts, seed)
                         print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                         try:
                             raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
                             last_raw = raw
                             cand_items = _extract_section_items(raw, srcs)
+                            cand_items = [it for it in cand_items if not _is_meaningless(it.get("text", ""))]
                             cand_items = _dedup_items(cand_items, seen_texts)
                             # 结构 enforcement：对字数不足的条目定向扩写，再跑一遍去重
                             cand_items = _expand_short_items(cand_items, provider, s, cfg)
@@ -1940,7 +1949,7 @@ def main():
         for provider in providers:
             print(f"\n▶ [热点/互动] 尝试 {provider['name']}")
             try:
-                for attempt in range(2):
+                for attempt in range(1):
                     sys_p, usr_p = build_meta_prompt(day, cfg, prev_type, search_ctx, meta_errs, seed)
                     print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                     try:
