@@ -396,6 +396,7 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
             {"role": "user", "content": user},
         ],
         "response_format": {"type": "json_object"},
+        "max_tokens": 2048,
     }
     if tools:
         body["tools"] = tools
@@ -459,6 +460,7 @@ def kimi_chat(system, user, base_url, api_key, model):
             "messages": messages,
             "tools": tools,
             "thinking": {"type": "disabled"},  # $web_search 必须禁用 thinking
+            "max_tokens": 2048,
         }
         # Kimi K2.6/K2.5 对 temperature/top_p 等采样参数有固定约束，非思考模式固定 0.6，
         # 传其他值会 400。这里不传，让平台使用默认值。
@@ -819,6 +821,54 @@ def _expand_short_items(items, provider, sec, cfg):
     except Exception:
         pass
     return items
+
+
+def _fill_missing_items(existing, missing, sec, day, cfg, ctx_for_sec, seen_texts,
+                        provider, use_tavily, use_kimi, search_mode):
+    """对条数不足的板块，定向补生成 missing 条，不依赖模型一次全部生成正确。"""
+    if missing <= 0:
+        return existing
+    d = date.fromisoformat(day)
+    date_cn = f"{d.year}年{d.month}月{d.day}日"
+    srcs = sec.get("sources") or cfg["source_whitelist"]
+    src_list = "\n".join(f"    {i}. {name}" for i, name in enumerate(srcs))
+    sys_p = (
+        "你是《报简说》日报编辑。本次任务：为下面板块补充生成指定数量的新闻摘要，"
+        "严格按格式输出，只输出 JSON，不要解释。\n"
+        "1. 只输出缺失的条目，不要重复已列出的内容。\n"
+        "2. 每条 text 为 20-60 个汉字的客观陈述句，source_idx 必须来自来源编号表。\n"
+        "3. 必须是 " + date_cn + " 当天或前一日真实新闻，不用旧闻。\n"
+        "4. 不得以逗号、顿号、句号等标点开头。\n"
+        "来源编号表：\n" + src_list + "\n"
+    )
+    existing_lines = "\n".join(f"  {i+1}. {it['text']}（来源：{it['source']}）"
+                               for i, it in enumerate(existing))
+    ban_lines = "\n".join(f"  - {t}" for t in (seen_texts or []))
+    usr_p = (
+        f"板块：{sec['name']}\n"
+        f"已生成 {len(existing)} 条：\n{existing_lines}\n\n"
+        f"请再补充生成 **恰好 {missing} 条** 不同事件的新闻摘要，与已生成条目不重复、"
+        f"与以下已有事件也不重复：\n{ban_lines}\n\n"
+        "本板块可用检索素材（仅可参考）：\n"
+        + ("\n\n".join(ctx_for_sec)[:2000] if ctx_for_sec else "（无素材）")
+        + "\n\n输出 schema（items 数组必须恰好 " + str(missing) + " 条）：\n"
+        "{\n"
+        '  "items": [\n'
+        '    {"text": "补充摘要1，含时间地点主体影响", "source_idx": 0},\n'
+        '    {"text": "补充摘要2，含时间地点主体影响", "source_idx": 1}\n'
+        "  ]\n"
+        "}\n"
+    )
+    try:
+        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+        extra = _extract_section_items(raw, srcs)
+        extra = [it for it in extra if not _is_meaningless(it.get("text", ""))]
+        merged = existing + extra
+        merged = _dedup_items(merged, seen_texts)
+        return merged[:sec["max"]]
+    except Exception as e:
+        print(f"  补生成失败: {e}")
+        return existing
 
 
 def _validate_section(items, sec, cfg):
@@ -1919,8 +1969,19 @@ def main():
                             cand_items = _dedup_items(cand_items, seen_texts)
                             sec_errs = _validate_section(cand_items, s, cfg)
                             if sec_errs:
-                                print("  校验未过：", sec_errs[0])
-                                continue
+                                # 若是条数不足，先尝试定向补生成，而不是立即换供应商/fallback
+                                missing = s["min"] - len(cand_items)
+                                if missing > 0 and any("条数" in e for e in sec_errs):
+                                    print(f"  条数不足，尝试补生成 {missing} 条…")
+                                    cand_items = _fill_missing_items(
+                                        cand_items, missing, s, day, cfg, ctx,
+                                        seen_texts, provider, use_tavily, use_kimi, search_mode
+                                    )
+                                    cand_items = _dedup_items(cand_items, seen_texts)
+                                    sec_errs = _validate_section(cand_items, s, cfg)
+                                if sec_errs:
+                                    print("  校验未过：", sec_errs[0])
+                                    continue
                             sec_items = cand_items
                             break
                         except LLMAuthError as e:
