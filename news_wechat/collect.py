@@ -532,6 +532,8 @@ def _clean_one(text):
     if not isinstance(text, str):
         return text
     t = text.strip()
+    # 清理开头反斜杠/斜杠/竖线/不可见字符（如 LaTeX 转义噪声 \\\\）
+    t = re.sub(r"^[\s\\/|]+", "", t)
     if not t:
         return ""
     # 快速丢弃：整段主要由英文大写导航词组成（如中国日报英文站导航）
@@ -916,7 +918,7 @@ def _section_fallback(sec, search_ctx, cfg, day):
     sec_names = [s["name"] for s in cfg["sections"]]
     picks, fb_idx = [], 0
     try:
-        parsed = _parse_search_ctx(search_ctx)
+        parsed = _parse_search_ctx(search_ctx, cfg)
         # 第一遍：严格按板块分类
         real = [it for it in parsed
                 if _classify_sec(it.get("text", ""), it.get("title", ""), sec_names) == sec["name"]]
@@ -961,7 +963,9 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     sites = "、".join(cfg["hotlist_sites"])
     sys_p = (
-        "你是《报简说》日报编辑。负责生成日报的「热点榜单」与「每日一问」两个板块，严格遵守：\n"
+        "你是《报简说》日报编辑。受众为 30–40 岁城市读者，语气中立、克制、专业，"
+        "不使用过于亲昵或老年向口语（如「老伴儿」「老伙计」「咱们这岁数」），也不使用卖萌式网络腔。\n"
+        "负责生成日报的「热点榜单」与「每日一问」两个板块，严格遵守：\n"
         "1. hotspot 必须输出 6-12 条（下限 6 条，绝不能少），"
         "每条只写话题标题（简短，≤20字），site 只能是给定热榜站点之一。\n"
         "2. interaction 每期只出 1 个高质量问题，靠读者打字留言参与，"
@@ -1306,7 +1310,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         '- fill:  {"type":"fill","topic":"…","template":"我家乡在__，今天__度。","hint":"…"}\n'
         '- echo:  {"type":"echo","topic":"上期答案揭晓","answer":"上期正确答案是…","note":"…"}\n'
         '- stance:{"type":"stance","topic":"…","left":"甲","right":"乙","hint":"…"}\n'
-        '- ask:   {"type":"ask","topic":"一个中老年读者想聊的开放问题，如「您年轻时最拿手的一道菜是啥？」","hint":"评论区聊聊您的故事…"}\n'
+        '- ask:   {"type":"ask","topic":"一个成年读者想聊的开放问题，如「这周末最想做的一件放松的事是啥？」","hint":"评论区聊聊你的安排…"}\n'
     )
     if errors:
         user_prompt += (
@@ -1484,7 +1488,7 @@ def _generate_once(provider, system, user, use_tavily, use_kimi, search_mode):
     raise RuntimeError(last_err or "所有候选模型均失败")
 
 
-def _parse_search_ctx(search_ctx):
+def _parse_search_ctx(search_ctx, cfg=None):
     items = []
     for block in search_ctx or []:
         m = re.match(r"【(.*?)】(.*?)(?:\n来源:\s*(\S+))?$", block, re.S)
@@ -1523,6 +1527,13 @@ def _parse_search_ctx(search_ctx):
             continue
         # 丢弃「相关议题受到关注」这类空泛填充
         if re.search(r"相关(?:议题|进展|动态|话题).*?(?:受到|引发).*?(?:关注|讨论|观察)", text) and cn_chars < 25:
+            continue
+        # 丢弃白名单媒体名罗列（导航/友链，如"海外网 法制网 环球网…每日"）
+        wl_set = set((cfg or {}).get("source_whitelist", [])) if cfg else set()
+        if wl_set and sum(1 for n in wl_set if n in text) >= 4:
+            continue
+        # 半截句（不以标点结尾）→ 丢弃，避免截断感（兜底宁可少、不要残缺）
+        if text and text[-1] not in "。！？；.!?；":
             continue
         src = "新华社"
         u = url.lower()
@@ -1638,7 +1649,7 @@ def _pick_fallback(name, idx, day):
 def rule_assemble(search_ctx, cfg, day):
     """第四级兜底：所有 LLM 供应商失败时，用 Tavily 检索结果规则拼装（无 AI 润色）。"""
     cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
-    parsed = _parse_search_ctx(search_ctx)
+    parsed = _parse_search_ctx(search_ctx, cfg)
     if not parsed:
         return None
     sections = cfg["sections"]
@@ -1784,7 +1795,7 @@ def _postprocess_whole(data, cfg, search_ctx, provider=None):
     """
     if not isinstance(data, dict):
         return None
-    parsed = _parse_search_ctx(search_ctx)
+    parsed = _parse_search_ctx(search_ctx, cfg)
     sec_names = [s["name"] for s in cfg["sections"]]
     cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
 
