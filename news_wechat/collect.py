@@ -98,6 +98,47 @@ WL_DOMAINS = {
 ALL_WL_DOMAINS = sorted({d for v in WL_DOMAINS.values() for d in v})
 WHITELIST = list(WL_DOMAINS.keys())
 
+# 集团媒体别名 → 规范名（用于输出 source 归一化，避免 AI 把「新华网」写成板块限定外的名字）
+# 规则：同一家媒体的不同称谓/子品牌，在校验时等价视为规范名；
+# prompt 也会告诉 AI「素材里看到左边这些名字，输出时写右边的规范名」。
+SOURCE_ALIASES = {
+    # 新华社系
+    "新华网": "新华社",
+    "新华网客户端": "新华社",
+    "新华社客户端": "新华社",
+    # 人民日报系
+    "人民网": "人民日报",
+    "人民日报客户端": "人民日报",
+    # 央视系
+    "央视网": "央视新闻",
+    "中央广播电视总台": "央视新闻",
+    "朝闻天下": "央视新闻",
+    # 中国新闻网
+    "中新网": "中国新闻网",
+    # 中国日报
+    "中国日报网": "中国日报",
+    # 环球时报
+    "环球网": "环球时报",
+    # 证券时报
+    "证券时报网": "证券时报",
+    # 第一财经
+    "第一财经网": "第一财经",
+    # 科技日报
+    "科技日报网": "科技日报",
+    # 新京报
+    "新京报网": "新京报",
+    # 中国青年报
+    "中国青年报客户端": "中国青年报",
+}
+
+
+def _norm_source_name(src):
+    """把媒体别名归一化为规范名；不在映射表则原样返回。"""
+    if not isinstance(src, str):
+        return src
+    return SOURCE_ALIASES.get(src.strip(), src.strip())
+
+
 # ---------------- 节日 / 节气识别（驱动「今日一问」应景出题） ----------------
 # 优先用 lunar_python 拿精确节气与农历节日；本地或无该库时回退到内置公历节日表 + 节气近似表。
 GREGORIAN_FESTIVALS = {
@@ -574,7 +615,8 @@ def validate(data, cfg):
                     f"必须通过补充时间/地点/主体/影响等真实细节扩写到 {cmin} 字以上：{t[:18]}…"
                 )
             sec_src = set(s.get("sources") or wl)
-            if it.get("source", "") not in sec_src:
+            norm_src = _norm_source_name(it.get("source", ""))
+            if norm_src not in sec_src:
                 allowed = "、".join(sorted(sec_src))
                 errors.append(
                     f"[{s['name']}] 第{i}条来源「{it.get('source')}」不在本板块限定来源，"
@@ -639,6 +681,7 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"  ⚠ {s['name']} 只能用：{' / '.join(s.get('sources', [])) or '（不限）'}"
         for s in cfg["sections"]
     )
+    alias_specs = "；".join(f"{k}→{v}" for k, v in SOURCE_ALIASES.items())
     wl = "、".join(cfg["source_whitelist"])
     sites = "、".join(cfg["hotlist_sites"])
 
@@ -652,7 +695,9 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "严禁用 filler 词（如'相关'、'有关'）硬凑，必须补充真实信息。"
         "组稿须按「早间新闻晨读（如央视《朝闻天下》式）」思路覆盖当天要闻：国内、国际、财经、科技、民生、文体各大类都要有代表，"
         "重大事件宁多勿漏，不要只盯着一两个话题。\n"
-        "3. 来源 source 必须是白名单中的某个媒体名，且确实报道过该事。\n"
+        "3. 来源 source 必须是白名单中的某个媒体名，且确实报道过该事。"
+        "若素材里的媒体名称是上表左边的别名（如新华网、人民网、央视网、中新网、中国日报网、环球网），"
+        "输出时必须写成该板块限定来源里的规范名（如新华社、人民日报、央视新闻、中国新闻网、中国日报、环球时报）。\n"
         "4. 热点榜单 hotspot 每条只写话题标题（简短），标注 site（只能是热榜站点之一）。\n"
         "5. 每日微语 quote 须为原创或公版励志短句，不得抄袭任何「微语报」「早安语」原文。\n"
         "6. 互动板块 interaction 每期只出 1 个「高质量」问题，靠读者打字留言参与，"
@@ -689,9 +734,10 @@ def build_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"不要写早于 {day} 超过 2 天的旧闻、周年纪念、历史回顾或旧热点重发；"
         f"每条新闻请先在脑中确认其报道日期在 {date_cn} 前后，无法确认日期的旧闻一律不采用。\n\n"
         f"各板块（顺序与名称必须严格一致）：{sec_names}。\n\n"
+        f"【来源别名映射（素材里看到这些名字，输出时必须换成右边的规范名）】{alias_specs}。\n\n"
         f"【铁律·各板块限定来源（校验会逐条检查，来源必须从下列清单中选，超出即作废重生成）】\n"
         f"{sec_src_specs}\n"
-        f"任何一条新闻的 source 字段必须是上面对应板块清单里的名字，一字不差。"
+        f"任何一条新闻的 source 字段必须是上面对应板块清单里的规范名，一字不差。"
         f"例如财经动态只能用新华社/央视新闻/证券时报/第一财经/财联社，绝不可用人民网、新华网等。\n\n"
         f"【板块条数硬要求（校验会精确检查，不满足直接重生成）】{sec_specs}。\n"
         f"请按「早间新闻晨读」思路组稿：覆盖当天国内外要闻、财经、科技、民生、文体，尽量不遗漏重大事件；"
@@ -1256,7 +1302,7 @@ def main():
         for q in queries:
             try:
                 print(f"  Tavily 查询: {q}")
-                res = tavily_search(q, tavily_key, max_results=2, days=2)
+                res = tavily_search(q, tavily_key, max_results=3, days=2)
                 print(f"    返回 {len(res)} 条")
                 search_ctx += res
             except Exception as e:
