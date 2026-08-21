@@ -139,6 +139,75 @@ def _norm_source_name(src):
     return SOURCE_ALIASES.get(src.strip(), src.strip())
 
 
+import difflib
+
+
+_TOPIC_STOP_WORDS = set(
+    "的 了 是 在 和 与 及 等 对 为 以 将 已 有 被 会 可 能 上 下 中 大 小 多 少 不 也 而 但 或 就 都 要 从 到 去 来 说 这 那 个 种 次 条 项 则 着 过 把 给 让 向 由 于 至 并 且 却 仍 因 此 如 果 虽 然 然 而 因 为 所 以 因 此 如 果 虽 然 但 是 不 过 只 是 只 要 除 非 既 又 一 二 三 四 五 六 七 八 九 十 百 千 万 亿 年 月 日 今 昨 明 后".split()
+)
+
+
+def _longest_common_substring(a, b):
+    """返回两条字符串的最长公共连续子串长度（中文按字符）。"""
+    if not a or not b:
+        return 0
+    m, n = len(a), len(b)
+    dp = [[0] * (n + 1) for _ in range(2)]
+    best = 0
+    for i in range(1, m + 1):
+        cur, prev = i % 2, (i - 1) % 2
+        for j in range(1, n + 1):
+            if a[i - 1] == b[j - 1]:
+                dp[cur][j] = dp[prev][j - 1] + 1
+                best = max(best, dp[cur][j])
+            else:
+                dp[cur][j] = 0
+    return best
+
+
+def _topic_signature(text, ngram=(2, 3, 4)):
+    """提取文本的关键中文 n-gram 签名（去掉停用词、标点、数字）。"""
+    if not text:
+        return set()
+    chars = [c for c in text if "\u4e00" <= c <= "\u9fff" and c not in _TOPIC_STOP_WORDS]
+    sig = set()
+    for n in ngram:
+        if len(chars) < n:
+            continue
+        for i in range(len(chars) - n + 1):
+            sig.add("".join(chars[i : i + n]))
+    return sig
+
+
+def _is_similar(a, b, threshold=0.58):
+    """判断两条中文文本是否主题重复。"""
+    if not a or not b:
+        return False
+    if difflib.SequenceMatcher(None, a, b).ratio() >= threshold:
+        return True
+    if _longest_common_substring(a, b) >= 6:
+        return True
+    sa, sb = _topic_signature(a), _topic_signature(b)
+    if not sa or not sb:
+        return False
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter >= 3 and inter / union >= 0.12
+
+
+def _dedup_items(items, seen_texts=None, threshold=0.58):
+    """对 items 做相似去重：与 seen_texts 或内部已保留文本相似则丢弃。"""
+    seen = list(seen_texts or [])
+    out = []
+    for it in items:
+        t = it.get("text", "") if isinstance(it, dict) else ""
+        if any(_is_similar(t, s, threshold) for s in seen):
+            continue
+        out.append(it)
+        seen.append(t)
+    return out
+
+
 # ---------------- 节日 / 节气识别（驱动「今日一问」应景出题） ----------------
 # 优先用 lunar_python 拿精确节气与农历节日；本地或无该库时回退到内置公历节日表 + 节气近似表。
 GREGORIAN_FESTIVALS = {
@@ -565,6 +634,8 @@ def _clean_one(text):
     # 残留中间省略号/空白
     t = re.sub(r"\s+", " ", t).strip()
     t = t.strip().strip('"').strip("'").strip().rstrip("：:；;，,—–-")
+    # 去除开头标点/空白（如 "，国家发展改革委..."）
+    t = re.sub(r"^[，。、；：！？,.;:!?\s]+", "", t)
     # 超长保护：>120 字按句边界截断并补句号
     if len(t) > 120:
         cut = t[:120].rstrip("，、；,;")
@@ -622,25 +693,36 @@ def _ctx_for_section(search_ctx, sec_name, sec_names):
     return keep
 
 
-def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seed=""):
+def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, seed=""):
     """单板块聚焦 prompt：只让模型生成「一个板块」的 items，来源用编号表约束。"""
     d = date.fromisoformat(day)
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     srcs = sec.get("sources") or cfg["source_whitelist"]
     src_list = "\n".join(f"    {i}. {name}" for i, name in enumerate(srcs))
     sys_p = (
-        "你是中文新闻编辑。只负责输出一个新闻板块的若干条摘要，严格遵守：\n"
+        "你是《报简说》日报编辑。只负责输出一个新闻板块的若干条摘要，严格遵守：\n"
         "1. 每条 text 为 20–60 个汉字的客观陈述句，不评论不引申；"
         "不足 20 字必须补充时间/地点/主体/影响等真实细节扩写。\n"
         "2. 每条 source_idx 必须是下面「来源编号表」中的某个序号（整数），不可写表外的媒体。\n"
         "3. 所有新闻须为 " + date_cn + " 当天或前一日真实发生的新近新闻，不用旧闻/周年/历史回顾。\n"
-        "4. 只输出 JSON，不要任何解释文字。\n"
+        "4. 同一板块内的各条新闻必须覆盖不同事件/不同主体，绝不允许同主题连续出现。\n"
+        "5. text 必须以汉字/数字/字母开头，不得以逗号、顿号、句号等标点符号开头。\n"
+        "6. 只输出 JSON，不要任何解释文字。\n"
         "来源编号表：\n" + src_list + "\n"
     )
     usr_p = (
         f"请生成「{sec['name']}」板块，共 {sec['min']}-{sec['max']} 条，"
         f"按重要等级从高到低排序，且**必须凑够 {sec['min']} 条下限**"
-        f"（不足时用同板块次重要但真实的当天新闻补足，绝不低于下限、绝不用旧闻编造）。\n\n"
+        f"（不足时用同板块次重要但真实的当天新闻补足，绝不低于下限、绝不用旧闻编造）。\n"
+        f"本板块 {sec['min']} 条新闻应覆盖 {sec['min']} 个不同的事件或主体，避免同一话题重复。\n\n"
+    )
+    if seen_texts:
+        usr_p += (
+            "【去重要求】以下事件已在其他板块出现，本板块严禁重复或改写后重复：\n- "
+            + "\n- ".join(seen_texts[:8])
+            + "\n\n"
+        )
+    usr_p += (
         f"本板块可用的检索素材（仅可据此成稿）：\n"
         + ("\n\n".join(ctx_for_sec)[:3500] if ctx_for_sec
            else "（无检索素材，请基于常识输出当天该领域真实可信的概括性新闻，来源须选自编号表）")
@@ -657,7 +739,8 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seed=""):
         usr_p += (
             "\n上一次未通过校验，请修正：\n- " + "\n- ".join(errors) +
             "\n修正：①字数不足就补充真实细节扩写到20字以上；"
-            "②source_idx 必须取上面编号表中的序号（整数），不得写表外媒体名。"
+            "②source_idx 必须取上面编号表中的序号（整数），不得写表外媒体名；"
+            "③若与已有板块重复，请换一条不同事件。"
         )
     return sys_p, usr_p
 
@@ -738,7 +821,7 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
     sites = "、".join(cfg["hotlist_sites"])
     sys_p = (
-        "你是中文新闻编辑。负责生成日报的「热点榜单」与「每日一问」两个板块，严格遵守：\n"
+        "你是《报简说》日报编辑。负责生成日报的「热点榜单」与「每日一问」两个板块，严格遵守：\n"
         "1. hotspot 必须输出 6-12 条（下限 6 条，绝不能少），"
         "每条只写话题标题（简短，≤20字），site 只能是给定热榜站点之一。\n"
         "2. interaction 每期只出 1 个高质量问题，靠读者打字留言参与，"
@@ -750,10 +833,9 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         f"热点榜单站点（site 只能取这些）：{sites}。\n"
         f"上一期互动卡型是「{prev_type or '无'}」，本期必须换一种卡型"
         f"（可选：guess/code/fill/echo/stance/ask）。\n"
-        f"今日一问选题方向：贴近30-40岁城市读者日常"
-        f"（工作通勤/家庭/消费数码/兴趣解压/天气），"
-        f"严禁时政外交、军事、灾情伤亡、政策抱怨、荐股、医疗建议、性别地域对立等易翻车话题；"
-        f"topic 要有钩子（如 ask「您手机里最常用的是哪个 APP？评论区聊聊」）。\n"
+        f"今日一问选题方向：以轻松、有话题性的国际趋势、文体娱乐、影视音乐、体育赛事、城市生活为主，"
+        f"面向30-40岁城市读者；topic 要有钩子（如 ask「暑期档哪部电影最让你想进影院？评论区聊聊」）。\n"
+        f"严禁时政外交、军事、灾情伤亡、政策抱怨、荐股、医疗建议、性别地域对立等易翻车话题。\n"
         f"检索素材（仅供参考选题方向）：\n"
         + ("\n\n".join(search_ctx)[:2000] if search_ctx else "（无素材）")
         + "\n\n输出 schema（hotspot items 必须 6-12 条，示例给出 6 条，site 只能从给定站点选）：\n"
@@ -850,13 +932,19 @@ def _validate_meta(meta, cfg):
 def _meta_fallback(cfg, day):
     """热点/互动兜底。"""
     sites = cfg.get("hotlist_sites", []) or ["微博热搜"]
-    hot_items = [{"text": f"热榜话题{i+1}持续引发关注", "site": sites[0]} for i in range(6)]
+    hot_items = [
+        {"text": "全球票房新片引热议", "site": sites[i % len(sites)]}
+        for i, _ in enumerate([
+            "全球票房新片引热议", "体育赛事今日看点", "国际话题登上热搜",
+            "影视音乐新动态", "城市生活新鲜事", "科技数码新玩法"
+        ])
+    ]
     interaction = {
         "title": "今日一问",
-        "lead": "朋友，今天咱们聊点轻松的。",
+        "lead": "朋友，今天聊点轻松的。",
         "card": {"type": "ask",
-                 "topic": "您平时早上喜欢喝豆浆还是牛奶？评论区聊聊您的习惯。",
-                 "hint": "欢迎在评论区分享您的日常。"},
+                 "topic": "最近有哪部影视或体育赛事让你特别想追？评论区聊聊。",
+                 "hint": "欢迎在评论区分享你的期待。"},
         "closing": "期待您的留言～",
     }
     return {"hotspot": {"name": "热点榜单", "items": hot_items}, "interaction": interaction}
@@ -1592,6 +1680,7 @@ def main():
 
     # -------- 系统性重构：逐板块聚焦生成（来源编号化，结构上消灭越界） --------
     sections_out = []
+    seen_texts = []
     for s in cfg["sections"]:
         srcs = s.get("sources") or cfg["source_whitelist"]
         ctx = _ctx_for_section(search_ctx, s["name"], sec_names)
@@ -1601,12 +1690,13 @@ def main():
             print(f"\n▶ [{s['name']}] 尝试 {provider['name']}")
             try:
                 for attempt in range(2):
-                    sys_p, usr_p = build_section_prompt(s, day, cfg, ctx, sec_errs, seed)
+                    sys_p, usr_p = build_section_prompt(s, day, cfg, ctx, sec_errs, seen_texts, seed)
                     print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                     try:
                         raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
                         last_raw = raw
                         cand_items = _extract_section_items(raw, srcs)
+                        cand_items = _dedup_items(cand_items, seen_texts)
                         sec_errs = _validate_section(cand_items, s, cfg)
                         if sec_errs:
                             print("  校验未过：", sec_errs[0])
@@ -1628,8 +1718,10 @@ def main():
         if not sec_items:
             print(f"⚠ [{s['name']}] 大模型失败，使用板块级兜底")
             sec_items = _section_fallback(s, search_ctx, cfg)
+            sec_items = _dedup_items(sec_items, seen_texts)
         print(f"✅ [{s['name']}] 成稿 {len(sec_items)} 条")
         sections_out.append({"name": s["name"], "items": sec_items})
+        seen_texts.extend(it["text"] for it in sec_items)
 
     # -------- meta：热点榜单 + 每日一问（独立聚焦 prompt） --------
     meta = None
