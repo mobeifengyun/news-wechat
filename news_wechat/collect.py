@@ -702,29 +702,37 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
     srcs = sec.get("sources") or cfg["source_whitelist"]
     src_list = "\n".join(f"    {i}. {name}" for i, name in enumerate(srcs))
     sys_p = (
-        "你是《报简说》日报编辑。只负责输出一个新闻板块的若干条摘要，严格遵守：\n"
-        "1. 每条 text 为 20–60 个汉字的客观陈述句，不评论不引申；"
+        "你是《报简说》日报编辑。只负责输出一个新闻板块的若干条摘要，严格遵守以下 6 条规则，每条各占一行：\n"
+        "规则 1：每条 text 为 20–60 个汉字的客观陈述句，不评论不引申；"
         "不足 20 字必须补充时间/地点/主体/影响等真实细节扩写。\n"
-        "2. 每条 source_idx 必须是下面「来源编号表」中的某个序号（整数），不可写表外的媒体。\n"
-        "3. 所有新闻须为 " + date_cn + " 当天或前一日真实发生的新近新闻，不用旧闻/周年/历史回顾。\n"
-        "4. 同一板块内的各条新闻必须覆盖不同事件/不同主体，绝不允许同主题连续出现。\n"
-        "5. text 必须以汉字/数字/字母开头，不得以逗号、顿号、句号等标点符号开头。\n"
-        "6. 只输出 JSON，不要任何解释文字。\n"
+        "规则 2：每条 source_idx 必须是下面「来源编号表」中的某个序号（整数），不可写表外的媒体名。\n"
+        "规则 3：所有新闻须为 " + date_cn + " 当天或前一日真实发生的新近新闻，不用旧闻/周年/历史回顾。\n"
+        "规则 4：同一板块内的各条新闻必须覆盖不同事件/不同主体，绝不允许同主题连续出现。\n"
+        "规则 5：text 必须以汉字/数字/字母开头，不得以逗号、顿号、句号等标点符号开头。\n"
+        "规则 6：只输出 JSON，不要任何解释文字、不要 markdown 代码块。\n"
         "来源编号表：\n" + src_list + "\n"
     )
-    # schema 示例必须与 min 条数一致，避免模型被 2 条示例暗示而少生成
+    # schema 示例必须与 min 条数一致，且用真实摘要示例，避免模型只输出 2 条占位符
     example_lines = []
+    eg_texts = [
+        f"{date_cn.split('日')[0]}日，{sec['name']}领域发生一起值得关注的重要事件，相关部门已作出回应。",
+        f"近期{sec['name']}领域出现新的政策动向，具体实施方案预计将在本周内陆续公布。",
+        f"业内人士表示，{sec['name']}市场当前呈现出稳中有升的发展态势，后续走势仍需观察。",
+        f"多家机构发布{sec['name']}相关报告，指出行业正在经历结构性调整，短期影响可控。",
+        f"围绕{sec['name']}领域的热点话题持续引发讨论，专家呼吁保持理性关注权威信息。",
+        f"{date_cn.split('日')[0]}日晚间，{sec['name']}板块传出最新消息，相关方正加紧推进后续工作。",
+    ]
     for i in range(sec["min"]):
-        eg = f"第{i+1}条为{sec['name']}当天真实新闻摘要，补充时间地点主体影响等细节，确保客观中立。"
+        eg = eg_texts[i % len(eg_texts)]
         example_lines.append(f'    {{"text": "{eg}", "source_idx": {i % len(srcs)}}}')
     example_block = ",\n".join(example_lines)
 
     usr_p = (
-        f"请生成「{sec['name']}」板块，共 {sec['min']}-{sec['max']} 条，"
-        f"按重要等级从高到低排序，且**必须凑够 {sec['min']} 条下限**"
-        f"（不足时用同板块次重要但真实的当天新闻补足，绝不低于下限、绝不用旧闻编造）。\n"
-        f"本板块 {sec['min']} 条新闻应覆盖 {sec['min']} 个不同的事件或主体，避免同一话题重复。\n"
-        f"字数按中文字符计算（含标点符号），每条必须在 {cfg['item_char_min']}-{cfg['item_char_max']} 字之间，"
+        f"请生成「{sec['name']}」板块。要求如下：\n"
+        f"• 输出 items 数组，数组长度必须恰好为 {sec['min']} 条（不得低于 {sec['min']} 条，也不得高于 {sec['max']} 条）。\n"
+        f"• 按重要等级从高到低排序；若素材不足，用同板块次重要但真实的当天新闻补足，绝不用旧闻编造。\n"
+        f"• {sec['min']} 条新闻必须覆盖 {sec['min']} 个不同的事件或主体，避免同一话题重复。\n"
+        f"• 字数按中文字符计算（含标点符号），每条必须在 {cfg['item_char_min']}-{cfg['item_char_max']} 字之间，"
         f"不足 {cfg['item_char_min']} 字时必须补充具体时间、地点、主体或影响扩写。\n\n"
     )
     if seen_texts:
@@ -734,11 +742,11 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
             + "\n\n"
         )
     usr_p += (
-        f"本板块可用的检索素材（仅可据此成稿）：\n"
+        f"本板块可用的检索素材（优先据此成稿）：\n"
         + ("\n\n".join(ctx_for_sec)[:3500] if ctx_for_sec
-           else "（无检索素材，请基于常识输出当天该领域真实可信的概括性新闻，来源须选自编号表）")
+           else "（当前检索素材为空，请基于当天该领域真实可信的公开信息概括成稿，来源须选自编号表）")
         + "\n\n"
-        f"输出 schema（必须恰好生成 {sec['min']} 条，严格照此格式）：\n"
+        f"输出 schema（items 数组长度必须恰好为 {sec['min']} 条，示例已给出 {sec['min']} 条，请严格替换为真实新闻）：\n"
         "{\n"
         '  "items": [\n'
         + example_block + "\n"
@@ -747,11 +755,11 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
     )
     if errors:
         usr_p += (
-            "\n上一次未通过校验，请修正：\n- " + "\n- ".join(errors) +
+            "\n上一次未通过校验，请重点修正：\n- " + "\n- ".join(errors) +
             f"\n修正：①字数不足就补充真实细节扩写到 {cfg['item_char_min']} 字以上；"
             "②source_idx 必须取上面编号表中的序号（整数），不得写表外媒体名；"
             "③若与已有板块重复，请换一条不同事件；"
-            f"④条数必须恰好 {sec['min']}-{sec['max']} 条。"
+            f"④items 数组长度必须恰好 {sec['min']} 条。"
         )
     return sys_p, usr_p
 
@@ -825,7 +833,7 @@ def _expand_short_items(items, provider, sec, cfg):
 
 def _fill_missing_items(existing, missing, sec, day, cfg, ctx_for_sec, seen_texts,
                         provider, use_tavily, use_kimi, search_mode):
-    """对条数不足的板块，定向补生成 missing 条，不依赖模型一次全部生成正确。"""
+    """对条数不足的板块，循环定向补生成，直到凑够 min 或无法继续。"""
     if missing <= 0:
         return existing
     d = date.fromisoformat(day)
@@ -834,37 +842,50 @@ def _fill_missing_items(existing, missing, sec, day, cfg, ctx_for_sec, seen_text
     src_list = "\n".join(f"    {i}. {name}" for i, name in enumerate(srcs))
     sys_p = (
         "你是《报简说》日报编辑。本次任务：为下面板块补充生成指定数量的新闻摘要，"
-        "严格按格式输出，只输出 JSON，不要解释。\n"
-        "1. 只输出缺失的条目，不要重复已列出的内容。\n"
-        "2. 每条 text 为 20-60 个汉字的客观陈述句，source_idx 必须来自来源编号表。\n"
-        "3. 必须是 " + date_cn + " 当天或前一日真实新闻，不用旧闻。\n"
-        "4. 不得以逗号、顿号、句号等标点开头。\n"
+        "严格按格式输出，只输出 JSON，不要解释、不要 markdown 代码块。\n"
+        "规则 1：只输出缺失的条目，不要重复已列出的内容。\n"
+        "规则 2：每条 text 为 20-60 个汉字的客观陈述句，source_idx 必须来自来源编号表。\n"
+        "规则 3：必须是 " + date_cn + " 当天或前一日真实新闻，不用旧闻。\n"
+        "规则 4：不得以逗号、顿号、句号等标点开头。\n"
+        "规则 5：输出 items 数组长度必须恰好等于要求的条数。\n"
         "来源编号表：\n" + src_list + "\n"
     )
-    existing_lines = "\n".join(f"  {i+1}. {it['text']}（来源：{it['source']}）"
-                               for i, it in enumerate(existing))
-    ban_lines = "\n".join(f"  - {t}" for t in (seen_texts or []))
-    usr_p = (
-        f"板块：{sec['name']}\n"
-        f"已生成 {len(existing)} 条：\n{existing_lines}\n\n"
-        f"请再补充生成 **恰好 {missing} 条** 不同事件的新闻摘要，与已生成条目不重复、"
-        f"与以下已有事件也不重复：\n{ban_lines}\n\n"
-        "本板块可用检索素材（仅可参考）：\n"
-        + ("\n\n".join(ctx_for_sec)[:2000] if ctx_for_sec else "（无素材）")
-        + "\n\n输出 schema（items 数组必须恰好 " + str(missing) + " 条）：\n"
-        "{\n"
-        '  "items": [\n'
-        '    {"text": "补充摘要1，含时间地点主体影响", "source_idx": 0},\n'
-        '    {"text": "补充摘要2，含时间地点主体影响", "source_idx": 1}\n'
-        "  ]\n"
-        "}\n"
-    )
+    merged = list(existing)
     try:
-        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
-        extra = _extract_section_items(raw, srcs)
-        extra = [it for it in extra if not _is_meaningless(it.get("text", ""))]
-        merged = existing + extra
-        merged = _dedup_items(merged, seen_texts)
+        for fill_round in range(3):
+            current_missing = sec["min"] - len(merged)
+            if current_missing <= 0:
+                break
+            print(f"  补生成第 {fill_round+1} 轮，当前缺口 {current_missing} 条…")
+            existing_lines = "\n".join(f"  {i+1}. {it['text']}（来源：{it['source']}）"
+                                       for i, it in enumerate(merged))
+            ban_lines = "\n".join(f"  - {t}" for t in (seen_texts or []))
+            usr_p = (
+                f"板块：{sec['name']}\n"
+                f"已生成 {len(merged)} 条：\n{existing_lines}\n\n"
+                f"请再补充生成 **恰好 {current_missing} 条** 不同事件的新闻摘要，"
+                "与已生成条目不重复、与以下已有事件也不重复：\n"
+                f"{ban_lines}\n\n"
+                "本板块可用检索素材（优先参考，不足时可基于当天公开信息补充）：\n"
+                + ("\n\n".join(ctx_for_sec)[:2000] if ctx_for_sec else "（当前检索素材为空）")
+                + f"\n\n输出 schema（items 数组必须恰好 {current_missing} 条）：\n"
+                "{\n"
+                '  "items": [\n'
+                + ",\n".join(f'    {{"text": "补充摘要{i+1}，含时间地点主体影响", "source_idx": {i % len(srcs)}}}'
+                             for i in range(current_missing))
+                + "\n  ]\n}\n"
+            )
+            raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+            extra = _extract_section_items(raw, srcs)
+            extra = [it for it in extra if not _is_meaningless(it.get("text", ""))]
+            before = len(merged)
+            merged = merged + extra
+            merged = _dedup_items(merged, seen_texts)
+            # 如果这一轮没有新增有效条目，继续尝试也徒劳
+            if len(merged) == before:
+                print(f"  补生成第 {fill_round+1} 轮未新增有效条目")
+                break
+            merged = merged[:sec["max"]]
         return merged[:sec["max"]]
     except Exception as e:
         print(f"  补生成失败: {e}")
@@ -888,25 +909,49 @@ def _validate_section(items, sec, cfg):
     return errs
 
 
-def _section_fallback(sec, search_ctx, cfg):
-    """板块级兜底：复用该板块真实检索条目，不足用填充句补足（不依赖主 LLM）。"""
+def _section_fallback(sec, search_ctx, cfg, day):
+    """板块级兜底：复用该板块真实检索条目，不足用占位句补足（不依赖主 LLM）。"""
     cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
     srcs = sec.get("sources") or cfg["source_whitelist"]
-    parsed = _parse_search_ctx(search_ctx)
     sec_names = [s["name"] for s in cfg["sections"]]
-    real = [it for it in parsed
-            if _classify_sec(it.get("text", ""), it.get("title", ""), sec_names) == sec["name"]]
     picks, fb_idx = [], 0
-    for it in real[:sec["max"]]:
-        src = _norm_source_name(it.get("source", ""))
-        if src not in set(srcs):
-            src = srcs[0]
-        fitted = _fit_text(it.get("text", ""), cmin, cmax)
-        if fitted and not _is_meaningless(fitted):
-            picks.append({"text": fitted, "source": src})
+    try:
+        parsed = _parse_search_ctx(search_ctx)
+        # 第一遍：严格按板块分类
+        real = [it for it in parsed
+                if _classify_sec(it.get("text", ""), it.get("title", ""), sec_names) == sec["name"]]
+        print(f"  [板块兜底] {sec['name']} 严格分类命中 {len(real)} 条")
+        for it in real[:sec["max"]]:
+            src = _norm_source_name(it.get("source", ""))
+            if src not in set(srcs):
+                src = srcs[0]
+            fitted = _fit_text(it.get("text", ""), cmin, cmax)
+            if fitted and not _is_meaningless(fitted):
+                picks.append({"text": fitted, "source": src})
+        # 第二遍：若不够，放宽为包含本板块任一关键词的真实条目
+        if len(picks) < sec["min"]:
+            kws = set(_SEC_KEYWORDS.get(sec["name"], []))
+            for it in parsed:
+                t = (it.get("text", "") + " " + it.get("title", "")).lower()
+                if any(kw in t for kw in kws):
+                    if it in real:
+                        continue
+                    src = _norm_source_name(it.get("source", ""))
+                    if src not in set(srcs):
+                        src = srcs[0]
+                    fitted = _fit_text(it.get("text", ""), cmin, cmax)
+                    if fitted and not _is_meaningless(fitted):
+                        picks.append({"text": fitted, "source": src})
+                        if len(picks) >= sec["max"]:
+                            break
+            print(f"  [板块兜底] {sec['name']} 放宽关键词命中后共 {len(picks)} 条")
+    except Exception as e:
+        print(f"  [板块兜底] {sec['name']} 检索条目处理失败: {e}")
+    # 最后不足则用占位句补足
     while len(picks) < sec["min"]:
-        picks.append({"text": _pick_fallback(sec["name"], fb_idx), "source": srcs[0]})
+        picks.append({"text": _pick_fallback(sec["name"], fb_idx, day), "source": srcs[0]})
         fb_idx += 1
+    print(f"  [板块兜底] {sec['name']} 最终输出 {len(picks[:sec['max']])} 条")
     return picks[:sec["max"]]
 
 
@@ -1491,6 +1536,11 @@ def _parse_search_ctx(search_ctx):
 
 
 def _fit_text(text, cmin, cmax):
+    """把原始文本适配到 [cmin, cmax] 字数区间。
+
+    只截断到合适标点，绝不用"受到广泛关注"等空话拼接；
+    长度不足则返回 None，让上层走 LLM 扩写或 fallback。
+    """
     text = _clean_one(text or "")
     text = text.strip().rstrip("，。；、,.;:?？!")
     if not text:
@@ -1505,55 +1555,48 @@ def _fit_text(text, cmin, cmax):
     text = text.strip().rstrip("，。；、,.;:?？!")
     if cmin <= len(text) <= cmax:
         return text
-    # 尝试轻度扩展（若原文已有句末标点则不再加逗号）
-    for tail in ("受到广泛关注。", "相关进展持续受到关注。", "各方正密切关注。"):
-        sep = "" if text[-1] in "，。；、,.;:?？!" else "，"
-        candidate = (text + sep + tail).strip()
-        if len(candidate) > cmax:
-            candidate = candidate[:cmax].rstrip("，。；、,.;:?？!") + "。"
-        if cmin <= len(candidate) <= cmax:
-            return candidate
     return None
 
 
-# 规则拼装兜底：各板块缺额时的自然填充句（多个，按顺序使用，避免重复）
-# 所有句子均保证 >=30 字且 <=60 字，避免被 item_char_min=28 校验卡掉。
+# 规则拼装兜底：当某板块实在无法从 LLM 获得足够真实条目时，用中性占位句补足。
+# 这些句子必须诚实、不编造事实，且避开 _is_meaningless 的空泛套话模式。
+# 占位句会明确出现"暂无更多"字样，便于后续人工识别。
 _NATURAL_FALLBACK = {
     "国内要闻": [
-        "今日国内重要议题受到各方关注，后续详情有待权威部门进一步发布。",
-        "国内相关部门正就当日热点议题展开部署，更多进展将持续披露。",
-        "本周内重点政策落地与民生议题持续受到舆论热议，外界保持关注。",
-        "围绕重大议题的跟踪报道陆续展开，后续动态值得社会各界保持关注。",
+        "截至{date}发稿，国内要闻板块暂无更多符合选稿标准的独立报道。",
+        "{date}国内要闻领域公开信息有限，编辑部将于后续更新中补充。",
+        "{date}暂无更多国内独立要闻可供选入，敬请留意后续推送。",
+        "{date}国内要闻素材不足，当前条目为占位提示，非具体新闻事件。",
     ],
     "国际新闻": [
-        "今日国际局势相关议题持续受到关注，各方保持观察并等待更多消息。",
-        "围绕热点地区的最新动向引发多方讨论，后续发展仍待进一步观察。",
-        "近期国际组织与多国政府就重点议题持续沟通，相关动态值得追踪。",
-        "境外媒体持续关注当前国际议题走向，外界等待有关方面进一步表态。",
+        "截至{date}发稿，国际新闻板块暂无更多符合选稿标准的独立报道。",
+        "{date}国际新闻领域公开信息有限，编辑部将于后续更新中补充。",
+        "{date}暂无更多国际独立要闻可供选入，敬请留意后续推送。",
+        "{date}国际新闻素材不足，当前条目为占位提示，非具体新闻事件。",
     ],
     "财经动态": [
-        "今日财经市场相关议题受到投资者关注，后续走势仍待进一步观察。",
-        "近期资本市场对宏观数据保持敏感，机构观点之间仍存在明显分歧。",
-        "今日行业板块表现受到资金面与情绪面双重影响，市场关注度较高。",
-        "主要经济数据发布前后，市场普遍持谨慎观望态度并等待更多信号。",
+        "截至{date}发稿，财经动态板块暂无更多符合选稿标准的独立报道。",
+        "{date}财经领域公开信息有限，编辑部将于后续更新中补充。",
+        "{date}暂无更多财经独立要闻可供选入，敬请留意后续推送。",
+        "{date}财经动态素材不足，当前条目为占位提示，非具体新闻事件。",
     ],
     "科技前沿": [
-        "今日科技领域相关进展受到行业关注，具体细节有待官方进一步披露。",
-        "新一轮技术演进与产业落地持续推进，相关动态引发业内广泛讨论。",
-        "头部厂商就核心技术议题分享了最新进展，业界关注后续落地情况。",
-        "科研机构与企业围绕前沿议题持续展开合作，成果值得各界期待。",
+        "截至{date}发稿，科技前沿板块暂无更多符合选稿标准的独立报道。",
+        "{date}科技领域公开信息有限，编辑部将于后续更新中补充。",
+        "{date}暂无更多科技独立进展可供选入，敬请留意后续推送。",
+        "{date}科技前沿素材不足，当前条目为占位提示，非具体新闻事件。",
     ],
     "社会民生": [
-        "今日社会民生相关议题受到公众关注，各方媒体持续跟踪报道进展。",
-        "近期与公众日常相关的话题持续升温，相关回应正在路上值得关注。",
-        "围绕民生热点的多方讨论持续展开，后续政策与服务保障将更明朗。",
-        "相关部门正就公众关切议题加紧部署，相关进展将适时对外发布。",
+        "截至{date}发稿，社会民生板块暂无更多符合选稿标准的独立报道。",
+        "{date}社会民生领域公开信息有限，编辑部将于后续更新中补充。",
+        "{date}暂无更多社会民生独立要闻可供选入，敬请留意后续推送。",
+        "{date}社会民生素材不足，当前条目为占位提示，非具体新闻事件。",
     ],
     "文体资讯": [
-        "今日文体领域相关话题受到关注，后续动态值得期待与进一步关注。",
-        "近期文化与体育活动持续引发讨论，相关进展将陆续对外披露。",
-        "围绕重要文体活动的筹备与举办，多方报道与评论持续展开关注。",
-        "热门文体话题持续在社交平台升温，业界反响值得持续追踪关注。",
+        "截至{date}发稿，文体资讯板块暂无更多符合选稿标准的独立报道。",
+        "{date}文体资讯领域公开信息有限，编辑部将于后续更新中补充。",
+        "{date}暂无更多文体独立资讯可供选入，敬请留意后续推送。",
+        "{date}文体资讯素材不足，当前条目为占位提示，非具体新闻事件。",
     ],
 }
 
@@ -1580,10 +1623,16 @@ def _is_meaningless(text):
     return False
 
 
-def _pick_fallback(name, idx):
-    """按板块名+序号轮询取填充句，避免同一句重复出现。"""
-    pool = _NATURAL_FALLBACK.get(name) or [f"{name}相关议题持续受到关注。"]
-    return pool[idx % len(pool)]
+def _pick_fallback(name, idx, day):
+    """按板块名+序号轮询取填充句，填入日期，避免同一句重复出现。"""
+    pool = _NATURAL_FALLBACK.get(name) or ["截至{date}发稿，该板块暂无更多符合选稿标准的独立报道。"]
+    tpl = pool[idx % len(pool)]
+    try:
+        d = date.fromisoformat(day)
+        date_cn = f"{d.month}月{d.day}日"
+    except Exception:
+        date_cn = "今日"
+    return tpl.format(date=date_cn)
 
 
 def rule_assemble(search_ctx, cfg, day):
@@ -1637,7 +1686,7 @@ def rule_assemble(search_ctx, cfg, day):
             it = fallback_pool.pop(0)
             picks.append({"text": it.get("text", ""), "source": _norm_source(it.get("source") or rep, s), "fb": False})
         while len(picks) < s["min"]:
-            picks.append({"text": _pick_fallback(name, fb_idx[name]),
+            picks.append({"text": _pick_fallback(name, fb_idx[name], day),
                           "source": _norm_source(rep, s), "fb": True})
             fb_idx[name] += 1
         section_items = []
@@ -1649,7 +1698,7 @@ def rule_assemble(search_ctx, cfg, day):
             raw_text = it["text"]
             fitted = _fit_text(raw_text, cmin, cmax)
             if not fitted or _is_meaningless(fitted):
-                fitted = _pick_fallback(name, fb_idx[name])
+                fitted = _pick_fallback(name, fb_idx[name], day)
                 fb_idx[name] += 1
                 section_items.append({"text": fitted, "source": _norm_source(rep, s)})
                 continue
@@ -1998,7 +2047,7 @@ def main():
                     break
             if not sec_items:
                 print(f"⚠ [{s['name']}] 大模型失败，使用板块级兜底")
-                sec_items = _section_fallback(s, search_ctx, cfg)
+                sec_items = _section_fallback(s, search_ctx, cfg, day)
                 sec_items = _dedup_items(sec_items, seen_texts)
             print(f"✅ [{s['name']}] 成稿 {len(sec_items)} 条")
             sections_out.append({"name": s["name"], "items": sec_items})
