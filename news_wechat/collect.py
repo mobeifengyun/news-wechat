@@ -431,10 +431,14 @@ def _host_of(url):
 
 
 def _rpm_of(host):
-    """当前生效的 RPM 上限：环境变量优先，其次本运行从 429 学到的。"""
+    """当前生效的 RPM 上限：环境变量优先，其次本运行从 429 学到的，
+    再次为已知平台默认值。Kimi/Moonshot 免费档默认 3 RPM，首调用即节流，
+    避免浪费一次 429 才学会，从源头大幅减少限流重试。"""
     rpm = int(os.environ.get("LLM_RPM", "0") or 0)
     if rpm <= 0:
         rpm = _detected_rpm.get(host, 0)
+    if rpm <= 0 and "moonshot" in (host or ""):
+        rpm = 3
     return rpm
 
 
@@ -553,7 +557,7 @@ def kimi_chat(system, user, base_url, api_key, model):
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    for _ in range(6):
+    for _ in range(3):
         body = {
             "model": model,
             "messages": messages,
