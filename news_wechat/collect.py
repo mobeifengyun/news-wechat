@@ -710,11 +710,20 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
         "6. 只输出 JSON，不要任何解释文字。\n"
         "来源编号表：\n" + src_list + "\n"
     )
+    # schema 示例必须与 min 条数一致，避免模型被 2 条示例暗示而少生成
+    example_lines = []
+    for i in range(sec["min"]):
+        eg = f"第{i+1}条为{sec['name']}当天真实新闻摘要，补充时间地点主体影响等细节，确保客观中立。"
+        example_lines.append(f'    {{"text": "{eg}", "source_idx": {i % len(srcs)}}}')
+    example_block = ",\n".join(example_lines)
+
     usr_p = (
         f"请生成「{sec['name']}」板块，共 {sec['min']}-{sec['max']} 条，"
         f"按重要等级从高到低排序，且**必须凑够 {sec['min']} 条下限**"
         f"（不足时用同板块次重要但真实的当天新闻补足，绝不低于下限、绝不用旧闻编造）。\n"
-        f"本板块 {sec['min']} 条新闻应覆盖 {sec['min']} 个不同的事件或主体，避免同一话题重复。\n\n"
+        f"本板块 {sec['min']} 条新闻应覆盖 {sec['min']} 个不同的事件或主体，避免同一话题重复。\n"
+        f"字数按中文字符计算（含标点符号），每条必须在 {cfg['item_char_min']}-{cfg['item_char_max']} 字之间，"
+        f"不足 {cfg['item_char_min']} 字时必须补充具体时间、地点、主体或影响扩写。\n\n"
     )
     if seen_texts:
         usr_p += (
@@ -727,20 +736,20 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
         + ("\n\n".join(ctx_for_sec)[:3500] if ctx_for_sec
            else "（无检索素材，请基于常识输出当天该领域真实可信的概括性新闻，来源须选自编号表）")
         + "\n\n"
-        f"输出 schema（严格照此）：\n"
+        f"输出 schema（必须恰好生成 {sec['min']} 条，严格照此格式）：\n"
         "{\n"
         '  "items": [\n'
-        '    {"text": "20-60字摘要", "source_idx": 0},\n'
-        '    {"text": "...", "source_idx": 1}\n'
+        + example_block + "\n"
         "  ]\n"
         "}\n"
     )
     if errors:
         usr_p += (
             "\n上一次未通过校验，请修正：\n- " + "\n- ".join(errors) +
-            "\n修正：①字数不足就补充真实细节扩写到20字以上；"
+            f"\n修正：①字数不足就补充真实细节扩写到 {cfg['item_char_min']} 字以上；"
             "②source_idx 必须取上面编号表中的序号（整数），不得写表外媒体名；"
-            "③若与已有板块重复，请换一条不同事件。"
+            "③若与已有板块重复，请换一条不同事件；"
+            f"④条数必须恰好 {sec['min']}-{sec['max']} 条。"
         )
     return sys_p, usr_p
 
@@ -774,6 +783,42 @@ def _extract_section_items(raw, srcs):
         src = srcs[idx] if 0 <= idx < len(srcs) else srcs[0]
         out.append({"text": t, "source": src})
     return out
+
+
+def _expand_short_items(items, provider, sec, cfg):
+    """对字数不足 cmin 的条目做定向扩写（结构 enforcement，不依赖模型自觉）。
+
+    把板块内所有短句打包成一次 JSON 数组扩写请求；若失败或结果仍不合规，
+    则保留原文，让上层 validate/retry/fallback 继续处理。
+    """
+    cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
+    short_idxs = [i for i, it in enumerate(items) if len(it.get("text", "")) < cmin]
+    if not short_idxs:
+        return items
+    originals = [items[i]["text"] for i in short_idxs]
+    system = (
+        f"你是《报简说》日报编辑。请将下面 {len(short_idxs)} 条「{sec['name']}」摘要"
+        f"逐条扩写到 {cmin}-{cmax} 个汉字（含标点符号），保留核心事实，"
+        f"补充具体时间、地点、主体、影响等真实细节，不要编造不存在的事件。"
+        f"输出 JSON 数组，顺序与输入一致，只输出数组。"
+    )
+    user = json.dumps(originals, ensure_ascii=False)
+    try:
+        raw = _generate_once(provider, system, user, False, False, "none")
+        m = re.search(r"\[.*\]", raw, re.S)
+        if not m:
+            return items
+        expanded = json.loads(m.group(0))
+        if not isinstance(expanded, list) or len(expanded) != len(short_idxs):
+            return items
+        for idx, new_text in zip(short_idxs, expanded):
+            if isinstance(new_text, str):
+                new_text = _clean_one(new_text)
+                if cmin <= len(new_text) <= cmax:
+                    items[idx]["text"] = new_text
+    except Exception:
+        pass
+    return items
 
 
 def _validate_section(items, sec, cfg):
@@ -1696,6 +1741,9 @@ def main():
                         raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
                         last_raw = raw
                         cand_items = _extract_section_items(raw, srcs)
+                        cand_items = _dedup_items(cand_items, seen_texts)
+                        # 结构 enforcement：对字数不足的条目定向扩写，再跑一遍去重
+                        cand_items = _expand_short_items(cand_items, provider, s, cfg)
                         cand_items = _dedup_items(cand_items, seen_texts)
                         sec_errs = _validate_section(cand_items, s, cfg)
                         if sec_errs:
