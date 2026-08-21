@@ -1420,6 +1420,12 @@ def _parse_search_ctx(search_ctx):
         # 丢弃明显的外文站导航/栏目名（英文词过多）
         if len(re.findall(r"[a-zA-Z]", text)) > cn_chars:
             continue
+        # 丢弃图片说明/图注/摄影署名（常见于新华社/人民日报配图稿）
+        if re.search(r"供图|图片来源|视觉中国|新华社发|\.\s*摄\s*[（(]|[（(].*?摄[）)]", text):
+            continue
+        # 丢弃直接引语/人物感受/采访片段（如游客说“很舒服”）
+        if re.search(r'(?:表示|说|觉得|感到|很喜欢|非常舒服|很舒服|特喜欢)[^。]{0,8}[“\\"”].{3,40}[“\\"”]', text):
+            continue
         # 丢弃「相关议题受到关注」这类空泛填充
         if re.search(r"相关(?:议题|进展|动态|话题).*?(?:受到|引发).*?(?:关注|讨论|观察)", text) and cn_chars < 25:
             continue
@@ -1512,9 +1518,11 @@ def _is_meaningless(text):
     # 空泛套话模式
     vague_patterns = [
         r"相关(?:议题|进展|动态|话题).*?(?:受到|引发).*?(?:关注|讨论|观察|披露)",
-        r"(?:今日|近期).*?(?:相关|有关).*?(?:议题|话题|进展).*?(?:值得|受到|引发)",
-        r"(?:各方|多方|有关).*?(?:持续|纷纷).*?(?:关注|讨论|观察|报道)",
+        r"(?:今日|近期).*?(?:相关|有关|国际局势|重点议题).*?(?:议题|话题|进展).*?(?:值得|受到|引发|持续沟通|保持观察|等待更多消息|值得追踪)",
+        r"(?:各方|多方|有关|多国).*?(?:持续|纷纷|保持).*?(?:关注|讨论|观察|报道|沟通|等待).*?(?:更多消息|进一步|值得追踪|待观察)",
         r"后续.*?(?:进展|动态|走势).*?(?:有待|仍待|待).*?(?:进一步|观察|披露)",
+        r"(?:围绕|关于).*?(?:最新动向|热点|动态|议题).*?(?:引发|受到|受到).*?(?:讨论|关注|观察)",
+        r".*?(?:国际组织|多国政府).*?(?:重点议题|相关议题).*?(?:持续沟通|保持沟通|保持关注).*?(?:相关动态|后续|值得追踪)",
     ]
     for p in vague_patterns:
         if re.search(p, text):
@@ -1651,6 +1659,115 @@ def rule_assemble(search_ctx, cfg, day):
     }
 
 
+def _map_source_to_section(src, sec):
+    """把任意来源名收敛到本板块限定来源内（用于后处理自动修正）。"""
+    src = _norm_source_name(src or "")
+    allowed = sec.get("sources") or []
+    if not allowed:
+        return src or "新华社"
+    if src in allowed:
+        return src
+    # 同域名集团匹配
+    doms = WL_DOMAINS.get(src)
+    if doms:
+        for cand in allowed:
+            if WL_DOMAINS.get(cand) == doms:
+                return cand
+    # 否则取板块第一个默认来源
+    return allowed[0]
+
+
+def _postprocess_whole(data, cfg, search_ctx, provider=None):
+    """整体生成后的代码层修正：来源归一化、过滤空话、字数扩写、条数补齐、跨板块去重。
+
+    目标：让模型在更自由的 prompt 下先生成完整连贯的内容，再用代码把约束修回来，
+    而不是指望模型字字句句都遵守所有规则。
+    """
+    if not isinstance(data, dict):
+        return None
+    parsed = _parse_search_ctx(search_ctx)
+    sec_names = [s["name"] for s in cfg["sections"]]
+    cmin, cmax = cfg["item_char_min"], cfg["item_char_max"]
+
+    # 先确保 sections 存在且顺序正确
+    sec_by_name = {s["name"]: s for s in cfg["sections"]}
+    sections_out = []
+    seen_texts = []  # 跨板块去重池
+
+    for sec_cfg in cfg["sections"]:
+        name = sec_cfg["name"]
+        sec_in = next((s for s in data.get("sections", []) if s.get("name") == name), {"name": name, "items": []})
+        items = []
+        for it in sec_in.get("items", []) or []:
+            if not isinstance(it, dict):
+                continue
+            text = _clean_one(it.get("text", ""))
+            if not text or _is_meaningless(text):
+                continue
+            # 图注/引语二次拦截（整体生成仍可能输出这类内容）
+            if re.search(r"供图|图片来源|视觉中国|新华社发|摄\s*[（(]", text):
+                continue
+            # 直接引语/感受句（常见于社会民生）拦截
+            if re.search(r'(?:表示|说|觉得|感到|很喜欢|非常舒服|很舒服|特喜欢)[^。]{0,8}[“\\"”].{3,40}[“\\"”]', text):
+                continue
+            src = _map_source_to_section(it.get("source", ""), sec_cfg)
+            items.append({"text": text, "source": src})
+
+        # 去重
+        items = _dedup_items(items, seen_texts)
+        seen_texts.extend(it["text"] for it in items)
+
+        # 字数扩写（如果带了 provider）
+        if provider is not None:
+            items = _expand_short_items(items, provider, sec_cfg, cfg)
+            items = _dedup_items(items, seen_texts)
+
+        # 条数补齐：不足下限从检索素材补；超过上限截断
+        if len(items) < sec_cfg["min"]:
+            need = sec_cfg["min"] - len(items)
+            bucket = [it for it in parsed
+                      if _classify_sec(it.get("text", ""), it.get("title", ""), sec_names) == name]
+            for it in bucket:
+                if need <= 0:
+                    break
+                text = _clean_one(it.get("text", ""))
+                if not text or _is_meaningless(text):
+                    continue
+                if re.search(r"供图|图片来源|视觉中国|新华社发", text):
+                    continue
+                src = _map_source_to_section(it.get("source", ""), sec_cfg)
+                candidate = {"text": text, "source": src}
+                if not _dedup_items([candidate], seen_texts):
+                    continue
+                items.append(candidate)
+                seen_texts.append(text)
+                need -= 1
+
+        # 仍然不足时，允许条数少一点（宁缺毋滥，绝不用空话填充）
+        items = items[:sec_cfg["max"]]
+        sections_out.append({"name": name, "items": items})
+
+    # 组装输出，保留 greeting/quote/hotspot/interaction
+    out = {
+        "greeting": _clean_one(data.get("greeting", "")),
+        "quote": _clean_one(data.get("quote", "")),
+        "sections": sections_out,
+        "hotspot": data.get("hotspot", {"name": "热点榜单", "items": []}),
+        "interaction": data.get("interaction", {}),
+    }
+    # hotspot/interaction 简单净化（热点标题允许较短，不过度清洗）
+    if isinstance(out["hotspot"], dict):
+        out["hotspot"]["name"] = "热点榜单"
+        clean_items = []
+        for it in out["hotspot"].get("items", []) or []:
+            t = (it.get("text", "") or "").strip().strip('"').strip("'").strip()
+            t = re.sub(r"\s+", " ", t).strip()
+            if len(t) >= 4:
+                clean_items.append({"text": t, "site": it.get("site", "微博热搜")})
+        out["hotspot"]["items"] = clean_items[:12]
+    return out
+
+
 def main():
     tz = timezone(timedelta(hours=8))
     day = sys.argv[1] if len(sys.argv) > 1 else datetime.now(tz).strftime("%Y-%m-%d")
@@ -1723,97 +1840,143 @@ def main():
     last_raw = ""
     sec_names = [s["name"] for s in cfg["sections"]]
 
-    # -------- 系统性重构：逐板块聚焦生成（来源编号化，结构上消灭越界） --------
-    sections_out = []
-    seen_texts = []
-    for s in cfg["sections"]:
-        srcs = s.get("sources") or cfg["source_whitelist"]
-        ctx = _ctx_for_section(search_ctx, s["name"], sec_names)
-        sec_items = None
-        sec_errs = []
-        for provider in providers:
-            print(f"\n▶ [{s['name']}] 尝试 {provider['name']}")
-            try:
-                for attempt in range(2):
-                    sys_p, usr_p = build_section_prompt(s, day, cfg, ctx, sec_errs, seen_texts, seed)
-                    print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
-                    try:
-                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
-                        last_raw = raw
-                        cand_items = _extract_section_items(raw, srcs)
-                        cand_items = _dedup_items(cand_items, seen_texts)
-                        # 结构 enforcement：对字数不足的条目定向扩写，再跑一遍去重
-                        cand_items = _expand_short_items(cand_items, provider, s, cfg)
-                        cand_items = _dedup_items(cand_items, seen_texts)
-                        sec_errs = _validate_section(cand_items, s, cfg)
-                        if sec_errs:
-                            print("  校验未过：", sec_errs[0])
-                            continue
-                        sec_items = cand_items
-                        break
-                    except LLMAuthError as e:
-                        print("  ⛔", e)
-                        break  # 该供应商鉴权失败，跳到下一个供应商
-                    except Exception as e:
-                        last_err = str(e)
-                        print("  解析失败:", e)
-                        sec_errs = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
-                        continue
-            except LLMAuthError:
-                continue
-            if sec_items:
-                break
-        if not sec_items:
-            print(f"⚠ [{s['name']}] 大模型失败，使用板块级兜底")
-            sec_items = _section_fallback(s, search_ctx, cfg)
-            sec_items = _dedup_items(sec_items, seen_texts)
-        print(f"✅ [{s['name']}] 成稿 {len(sec_items)} 条")
-        sections_out.append({"name": s["name"], "items": sec_items})
-        seen_texts.extend(it["text"] for it in sec_items)
-
-    # -------- meta：热点榜单 + 每日一问（独立聚焦 prompt） --------
-    meta = None
-    meta_errs = []
+    # -------- 第一层：整体生成（内容更完整连贯；约束由代码后处理修正） --------
     for provider in providers:
-        print(f"\n▶ [热点/互动] 尝试 {provider['name']}")
+        print(f"\n▶ [整体生成] 尝试 {provider['name']}")
         try:
             for attempt in range(2):
-                sys_p, usr_p = build_meta_prompt(day, cfg, prev_type, search_ctx, meta_errs, seed)
+                sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, [], seed)
                 print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                 try:
                     raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
                     last_raw = raw
-                    cand_meta = _extract_meta(raw, cfg)
-                    meta_errs = _validate_meta(cand_meta, cfg)
-                    if meta_errs:
-                        print("  校验未过：", meta_errs[0])
-                        continue
-                    meta = cand_meta
-                    break
+                    m = re.search(r"\{.*\}", raw, re.S)
+                    if m:
+                        raw = m.group(0)
+                    cand = json.loads(raw)
+                    if not isinstance(cand, dict):
+                        raise ValueError(f"模型返回的是 {type(cand).__name__}，必须返回 JSON 对象")
+                    cand = _sanitize_candidate(cand, cfg)
+                    if cand is None:
+                        raise ValueError("净化后成稿为空")
+                    cand = _postprocess_whole(cand, cfg, search_ctx, provider)
+                    if cand is None:
+                        raise ValueError("后处理后成稿为空")
                 except LLMAuthError as e:
                     print("  ⛔", e)
                     break
                 except Exception as e:
                     last_err = str(e)
                     print("  解析失败:", e)
-                    meta_errs = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
                     continue
+
+                errs = validate(cand, cfg)
+                if errs:
+                    print("  校验未过：", errs[0])
+                    continue
+                if audit_block(cand, day) > 0:
+                    print("  合规 BLOCK，重试")
+                    continue
+                data = cand
+                break
         except LLMAuthError:
             continue
-        if meta:
+        if data:
+            print("✅ [整体生成] 成稿成功")
             break
-    if not meta:
-        print("⚠ [热点/互动] 大模型失败，使用兜底")
-        meta = _meta_fallback(cfg, day)
 
-    data = {
-        "greeting": f"{day} 早安，来看看今天值得知道的事。",
-        "quote": "平凡的一天，也能过得有滋有味。",
-        "sections": sections_out,
-        "hotspot": meta["hotspot"],
-        "interaction": meta["interaction"],
-    }
-    data = _sanitize_candidate(data, cfg)
+    # -------- 第二层：单板块聚焦生成（整体失败时降级使用） --------
+    if not data:
+        sections_out = []
+        seen_texts = []
+        for s in cfg["sections"]:
+            srcs = s.get("sources") or cfg["source_whitelist"]
+            ctx = _ctx_for_section(search_ctx, s["name"], sec_names)
+            sec_items = None
+            sec_errs = []
+            for provider in providers:
+                print(f"\n▶ [{s['name']}] 尝试 {provider['name']}")
+                try:
+                    for attempt in range(2):
+                        sys_p, usr_p = build_section_prompt(s, day, cfg, ctx, sec_errs, seen_texts, seed)
+                        print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
+                        try:
+                            raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                            last_raw = raw
+                            cand_items = _extract_section_items(raw, srcs)
+                            cand_items = _dedup_items(cand_items, seen_texts)
+                            # 结构 enforcement：对字数不足的条目定向扩写，再跑一遍去重
+                            cand_items = _expand_short_items(cand_items, provider, s, cfg)
+                            cand_items = _dedup_items(cand_items, seen_texts)
+                            sec_errs = _validate_section(cand_items, s, cfg)
+                            if sec_errs:
+                                print("  校验未过：", sec_errs[0])
+                                continue
+                            sec_items = cand_items
+                            break
+                        except LLMAuthError as e:
+                            print("  ⛔", e)
+                            break  # 该供应商鉴权失败，跳到下一个供应商
+                        except Exception as e:
+                            last_err = str(e)
+                            print("  解析失败:", e)
+                            sec_errs = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
+                            continue
+                except LLMAuthError:
+                    continue
+                if sec_items:
+                    break
+            if not sec_items:
+                print(f"⚠ [{s['name']}] 大模型失败，使用板块级兜底")
+                sec_items = _section_fallback(s, search_ctx, cfg)
+                sec_items = _dedup_items(sec_items, seen_texts)
+            print(f"✅ [{s['name']}] 成稿 {len(sec_items)} 条")
+            sections_out.append({"name": s["name"], "items": sec_items})
+            seen_texts.extend(it["text"] for it in sec_items)
+    
+        # -------- meta：热点榜单 + 每日一问（独立聚焦 prompt） --------
+        meta = None
+        meta_errs = []
+        for provider in providers:
+            print(f"\n▶ [热点/互动] 尝试 {provider['name']}")
+            try:
+                for attempt in range(2):
+                    sys_p, usr_p = build_meta_prompt(day, cfg, prev_type, search_ctx, meta_errs, seed)
+                    print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
+                    try:
+                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                        last_raw = raw
+                        cand_meta = _extract_meta(raw, cfg)
+                        meta_errs = _validate_meta(cand_meta, cfg)
+                        if meta_errs:
+                            print("  校验未过：", meta_errs[0])
+                            continue
+                        meta = cand_meta
+                        break
+                    except LLMAuthError as e:
+                        print("  ⛔", e)
+                        break
+                    except Exception as e:
+                        last_err = str(e)
+                        print("  解析失败:", e)
+                        meta_errs = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
+                        continue
+            except LLMAuthError:
+                continue
+            if meta:
+                break
+        if not meta:
+            print("⚠ [热点/互动] 大模型失败，使用兜底")
+            meta = _meta_fallback(cfg, day)
+    
+        data = {
+            "greeting": f"{day} 早安，来看看今天值得知道的事。",
+            "quote": "平凡的一天，也能过得有滋有味。",
+            "sections": sections_out,
+            "hotspot": meta["hotspot"],
+            "interaction": meta["interaction"],
+        }
+        data = _sanitize_candidate(data, cfg)
 
     # 最终总校验保险：仍不合规则整体走 Tavily 规则拼装兜底
     final_errs = validate(data, cfg)
