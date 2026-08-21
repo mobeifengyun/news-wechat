@@ -900,6 +900,88 @@ def _extract_section_items(raw, srcs):
     return out
 
 
+def build_batch_prompt(batch, day, cfg, ctx_map, seen_texts=None, errors_map=None, seed=""):
+    """分批生成 prompt：一次让模型输出 batch 内多个板块的 items，大幅减少 LLM 调用数。
+
+    输出 schema：{"sections":[{"name":板块名,"items":[{"text":...,"source_idx":...}]}]}。
+    每个板块用独立的「来源编号表」约束 source_idx，避免跨板块越界。
+    空/不足板块由调用方走单板块 fallback，质量不丢。配合 _extract_batch_items 解析。
+    """
+    d = date.fromisoformat(day)
+    date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
+    errors_map = errors_map or {}
+    sys_p = (
+        "你是《报简说》日报编辑。本次需一次性输出多个新闻板块的摘要，严格遵守规则：\n"
+        "规则 1：每条 text 为 20–60 个汉字的客观陈述句，不评论不引申；不足 20 字必须补充真实细节扩写。\n"
+        "规则 2：每条 source_idx 必须是该板块「来源编号表」中的序号（整数），不可写表外媒体名。\n"
+        "规则 3：所有新闻须为 " + date_cn + " 当天或前一日真实发生的新近新闻，不用旧闻。\n"
+        "规则 4：同一板块内各条须覆盖不同事件/主体，绝不允许同主题连续出现。\n"
+        "规则 5：text 必须以汉字/数字/字母开头，不得以标点符号开头。\n"
+        "规则 6：只输出 JSON，不要任何解释、不要 markdown 代码块。\n"
+    )
+    blocks = []
+    for sec in batch:
+        srcs = sec.get("sources") or cfg["source_whitelist"]
+        src_list = "\n".join(f"    {i}. {name}" for i, name in enumerate(srcs))
+        ctx = ctx_map.get(sec["name"]) or []
+        ctx_txt = "\n\n".join(ctx)[:2500] if ctx else "（素材为空，基于当天真实公开信息概括，来源选自编号表）"
+        blocks.append(
+            f"【板块 {sec['name']}】\n"
+            f"该板块来源编号表：\n{src_list}\n"
+            f"要求：输出 items 数组，长度恰好 {sec['min']} 条（不低于 {sec['min']}），"
+            f"覆盖 {sec['min']} 个不同事件，每条 {cfg['item_char_min']}-{cfg['item_char_max']} 字。\n"
+            f"该板块可用检索素材：\n{ctx_txt}\n"
+        )
+    sys_p += "各板块定义如下：\n" + "\n".join(blocks)
+    usr_p = (
+        "请输出如下 JSON（sections 数组，顺序与上面板块一致）：\n"
+        "{\n  \"sections\": [\n"
+        + ",\n".join(
+            '    {\n      "name": "' + sec["name"] + '",\n      "items": [\n'
+            '        {"text": "（替换为真实新闻摘要）", "source_idx": 0}'
+            + (",\n        {\"text\": \"...\", \"source_idx\": 1}" if sec["min"] > 1 else "")
+            + "\n      ]\n    }"
+            for sec in batch
+        )
+        + "\n  ]\n}\n"
+    )
+    if seen_texts:
+        usr_p += "\n【去重】以下事件已在其他板块出现，严禁重复或改写后重复：\n- " + "\n- ".join(seen_texts[:8]) + "\n"
+    if errors_map:
+        usr_p += "\n上一次未通过校验，请修正：\n" + "\n".join(f"- [{k}] " + "; ".join(v) for k, v in errors_map.items())
+    return sys_p, usr_p
+
+
+def _extract_batch_items(raw, batch, cfg):
+    """从分批 JSON 提取各板块 items，按 batch 顺序返回 list（与 batch 一一对应）。"""
+    empty = [[] for _ in batch]
+    if not isinstance(raw, str):
+        return empty
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        raw = m.group(0)
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return empty
+    secs_out = obj.get("sections", []) or []
+    by_name = {}
+    for s in secs_out:
+        if isinstance(s, dict) and s.get("name"):
+            by_name[s.get("name")] = s
+    result = []
+    for sec in batch:
+        s = by_name.get(sec["name"])
+        srcs = sec.get("sources") or cfg["source_whitelist"]
+        if not isinstance(s, dict):
+            result.append([])
+            continue
+        # 复用单板块解析：把该板块序列化为 {"items":[...]} 交 _extract_section_items
+        sub = json.dumps({"items": s.get("items", []) or []}, ensure_ascii=False)
+        result.append(_extract_section_items(sub, srcs))
+    return result
+
+
 def _expand_short_items(items, provider, sec, cfg):
     """对字数不足 cmin 的条目做定向扩写（结构 enforcement，不依赖模型自觉）。
 
@@ -2106,66 +2188,66 @@ def main():
                 print("✅ [整体生成] 成稿成功")
                 break
 
-    # -------- 主路径：单板块聚焦生成（来源编号化，质量可控、速度快）--------
+    # -------- 主路径：分批聚焦生成（每批 2 板块一次调用，减少 LLM 调用数，3 RPM 下 5–8 分钟跑完）--------
     if not data:
         sections_out = []
         seen_texts = []
-        for s in cfg["sections"]:
-            srcs = s.get("sources") or cfg["source_whitelist"]
-            ctx = _ctx_for_section(search_ctx, s["name"], sec_names)
-            sec_items = None
-            sec_errs = []
+        BATCH = 2
+        all_secs = cfg["sections"]
+        for bi in range(0, len(all_secs), BATCH):
+            batch = all_secs[bi:bi + BATCH]
+            batch_items = [None] * len(batch)
             for provider in providers:
-                print(f"\n▶ [{s['name']}] 尝试 {provider['name']}")
+                print(f"\n▶ 批次{bi // BATCH + 1} [{'/'.join(s['name'] for s in batch)}] 尝试 {provider['name']}")
                 try:
-                    for attempt in range(1):
-                        sys_p, usr_p = build_section_prompt(s, day, cfg, ctx, sec_errs, seen_texts, seed)
-                        print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
-                        try:
-                            raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
-                            last_raw = raw
-                            cand_items = _extract_section_items(raw, srcs)
-                            cand_items = [it for it in cand_items if not _is_meaningless(it.get("text", ""))]
-                            cand_items = _dedup_items(cand_items, seen_texts)
-                            # 结构 enforcement：对字数不足的条目定向扩写，再跑一遍去重
-                            cand_items = _expand_short_items(cand_items, provider, s, cfg)
-                            cand_items = _dedup_items(cand_items, seen_texts)
-                            sec_errs = _validate_section(cand_items, s, cfg)
-                            if sec_errs:
-                                # 若是条数不足，先尝试定向补生成，而不是立即换供应商/fallback
-                                missing = s["min"] - len(cand_items)
-                                if missing > 0 and any("条数" in e for e in sec_errs):
-                                    print(f"  条数不足，尝试补生成 {missing} 条…")
-                                    cand_items = _fill_missing_items(
-                                        cand_items, missing, s, day, cfg, ctx,
-                                        seen_texts, provider, use_tavily, use_kimi, search_mode
-                                    )
-                                    cand_items = _dedup_items(cand_items, seen_texts)
-                                    sec_errs = _validate_section(cand_items, s, cfg)
-                                if sec_errs:
-                                    print("  校验未过：", sec_errs[0])
-                                    continue
-                            sec_items = cand_items
-                            break
-                        except LLMAuthError as e:
-                            print("  ⛔", e)
-                            break  # 该供应商鉴权失败，跳到下一个供应商
-                        except Exception as e:
-                            last_err = str(e)
-                            print("  解析失败:", e)
-                            sec_errs = [f"模型返回无法解析为 JSON：{str(e)[:80]}"]
-                            continue
-                except LLMAuthError:
+                    batch_ctx = {s["name"]: _ctx_for_section(search_ctx, s["name"], sec_names) for s in batch}
+                    sys_p, usr_p = build_batch_prompt(batch, day, cfg, batch_ctx, seen_texts, {}, seed)
+                    raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                    parsed = _extract_batch_items(raw, batch, cfg)
+                except Exception as e:
+                    print("  批次生成异常:", e)
                     continue
-                if sec_items:
+                for k, sec in enumerate(batch):
+                    items = parsed[k] if k < len(parsed) else []
+                    if not items:
+                        continue
+                    ctx = _ctx_for_section(search_ctx, sec["name"], sec_names)
+                    items = _expand_short_items(items, provider, sec, cfg)
+                    items = _dedup_items(items, seen_texts)
+                    errs = _validate_section(items, sec, cfg)
+                    if errs:
+                        missing = sec["min"] - len(items)
+                        if missing > 0 and any("条数" in e for e in errs):
+                            items = _fill_missing_items(items, missing, sec, day, cfg, ctx,
+                                                        seen_texts, provider, use_tavily, use_kimi, search_mode)
+                            items = _dedup_items(items, seen_texts)
+                    batch_items[k] = items
+                if all(batch_items[k] is not None and len(batch_items[k]) >= batch[k]["min"]
+                       for k in range(len(batch))):
                     break
-            if not sec_items:
-                print(f"⚠ [{s['name']}] 大模型失败，使用板块级兜底")
-                sec_items = _section_fallback(s, search_ctx, cfg, day)
-                sec_items = _dedup_items(sec_items, seen_texts)
-            print(f"✅ [{s['name']}] 成稿 {len(sec_items)} 条")
-            sections_out.append({"name": s["name"], "items": sec_items})
-            seen_texts.extend(it["text"] for it in sec_items)
+            # 本批次结束：空/不足板块单板块补生成，仍不足走板块级兜底
+            for k, sec in enumerate(batch):
+                items = batch_items[k] or []
+                ctx = _ctx_for_section(search_ctx, sec["name"], sec_names)
+                if len(items) < sec["min"]:
+                    print(f"\n▶ [{sec['name']}] 分批不足，单板块补生成")
+                    for provider in providers:
+                        try:
+                            sp, up = build_section_prompt(sec, day, cfg, ctx, [], seen_texts, seed)
+                            raw = _generate_once(provider, sp, up, use_tavily, use_kimi, search_mode)
+                            items = _extract_section_items(raw, sec.get("sources") or cfg["source_whitelist"])
+                            items = [it for it in items if not _is_meaningless(it.get("text", ""))]
+                            break
+                        except Exception as e:
+                            print("  单板块补生成失败:", e)
+                            continue
+                if len(items) < sec["min"]:
+                    print(f"⚠ [{sec['name']}] 仍不足，板块级兜底")
+                    items = _section_fallback(sec, search_ctx, cfg, day)
+                items = _dedup_items(items, seen_texts)
+                print(f"✅ [{sec['name']}] 成稿 {len(items)} 条")
+                sections_out.append({"name": sec["name"], "items": items})
+                seen_texts.extend(it["text"] for it in items)
     
         # -------- meta：热点榜单 + 每日一问（独立聚焦 prompt） --------
         meta = None
