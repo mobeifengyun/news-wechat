@@ -2340,4 +2340,21 @@ def main():
 
 if __name__ == "__main__":
     print("collect.py 启动", flush=True)
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # 任何未捕获异常都写诊断文件，供 workflow「上传采集诊断」步骤回流到仓库，
+        # 这样即使云端崩溃，本地 fetch 也能拿到真实 traceback（否则只能干瞪眼）。
+        import traceback as _tb
+        try:
+            err_path = os.path.join(BASE, "output", "_collect_error.txt")
+            with open(err_path, "w", encoding="utf-8") as _ef:
+                _ef.write("collect.py 崩溃于 %s\n" % datetime.now().isoformat())
+                _ef.write("argv: %s\n" % " ".join(sys.argv))
+                _ef.write("".join(_tb.format_exception(type(e), e, e.__traceback__)))
+            print("❌ collect.py 未捕获异常，已写入 _collect_error.txt", flush=True)
+        except Exception:
+            pass
+        raise
