@@ -753,6 +753,23 @@ def _clean_one(text):
     return t
 
 
+def _clean_hotspot(text):
+    """热点标题/互动短文案的轻量清洗：允许短文本，只去首尾噪声符号和 markdown 标记。"""
+    if not isinstance(text, str):
+        return ""
+    t = text.strip()
+    if not t:
+        return ""
+    # 去掉 markdown 行内标记
+    t = re.sub(r"[*_`#>]", "", t)
+    # 去掉首尾常见标点/空白
+    t = re.sub(r"^[，。、；：！？,.;:!?\s]+", "", t)
+    t = re.sub(r"[，。、；：！？,.;:!?\s]+$", "", t)
+    # 合并多余空白
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _sanitize_candidate(cand, cfg=None):
     """遍历成稿 JSON，清理所有文本字段的噪声（不改动结构/来源/站点）。
 
@@ -1204,19 +1221,23 @@ def _extract_meta(raw, cfg):
     for it in hot.get("items", []) or []:
         if not isinstance(it, dict):
             continue
-        t = _clean_one(it.get("text", ""))
+        t = _clean_hotspot(it.get("text", ""))
         if t:
-            hi.append({"text": t, "site": it.get("site", cfg["hotlist_sites"][0])})
+            site = it.get("site", cfg["hotlist_sites"][0])
+            # site 不在白名单时回落到第一个合法站点，避免后续校验失败
+            if site not in cfg.get("hotlist_sites", []):
+                site = cfg["hotlist_sites"][0]
+            hi.append({"text": t, "site": site})
     inter = obj.get("interaction") or {}
     if isinstance(inter, dict):
         for f in ("title", "lead", "closing"):
             if f in inter and isinstance(inter[f], str):
-                inter[f] = _clean_one(inter[f])
+                inter[f] = _clean_hotspot(inter[f])
         card = inter.get("card")
         if isinstance(card, dict):
             for f in ("topic", "template", "hint", "answer", "note"):
                 if f in card and isinstance(card[f], str):
-                    card[f] = _clean_one(card[f])
+                    card[f] = _clean_hotspot(card[f])
     return {"hotspot": {"name": hot.get("name", "热点榜单"), "items": hi},
             "interaction": inter}
 
@@ -1261,20 +1282,21 @@ def _validate_meta(meta, cfg):
 def _meta_fallback(cfg, day):
     """热点/互动兜底。"""
     sites = cfg.get("hotlist_sites", []) or ["微博热搜"]
+    hot_texts = [
+        "全球票房新片引热议", "体育赛事今日看点", "国际话题登上热搜",
+        "影视音乐新动态", "城市生活新鲜事", "科技数码新玩法"
+    ]
     hot_items = [
-        {"text": "全球票房新片引热议", "site": sites[i % len(sites)]}
-        for i, _ in enumerate([
-            "全球票房新片引热议", "体育赛事今日看点", "国际话题登上热搜",
-            "影视音乐新动态", "城市生活新鲜事", "科技数码新玩法"
-        ])
+        {"text": txt, "site": sites[i % len(sites)]}
+        for i, txt in enumerate(hot_texts)
     ]
     interaction = {
         "title": "今日一问",
-        "lead": "朋友，今天聊点轻松的。",
+        "lead": "今日话题，欢迎参与讨论。",
         "card": {"type": "ask",
-                 "topic": "最近有哪部影视或体育赛事让你特别想追？评论区聊聊。",
-                 "hint": "欢迎在评论区分享你的期待。"},
-        "closing": "期待您的留言～",
+                 "topic": "最近有哪部影视、音乐或体育赛事让你觉得值得追更？",
+                 "hint": "简述理由即可。"},
+        "closing": "欢迎在评论区留下看法。",
     }
     return {"hotspot": {"name": "热点榜单", "items": hot_items}, "interaction": interaction}
 
@@ -2255,7 +2277,7 @@ def main():
         for provider in providers:
             print(f"\n▶ [热点/互动] 尝试 {provider['name']}")
             try:
-                for attempt in range(1):
+                for attempt in range(2):
                     sys_p, usr_p = build_meta_prompt(day, cfg, prev_type, search_ctx, meta_errs, seed)
                     print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                     try:
@@ -2265,6 +2287,12 @@ def main():
                         meta_errs = _validate_meta(cand_meta, cfg)
                         if meta_errs:
                             print("  校验未过：", meta_errs[0])
+                            # 若是热点条数不足，下一轮提示补生成
+                            if cand_meta:
+                                hot = cand_meta.get("hotspot") or {}
+                                n_hot = len(hot.get("items", []))
+                                if 0 < n_hot < 6:
+                                    meta_errs.append(f"热点榜单当前仅 {n_hot} 条，请重新输出至少 6 条、至多 12 条不同话题")
                             continue
                         meta = cand_meta
                         break
