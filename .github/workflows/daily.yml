@@ -170,7 +170,7 @@ jobs:
         env:
           PAGE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
           SCKEY: ${{ secrets.SCKEY }}
-        run: python news_wechat/push_sc.py "$PAGE_URL" "${{ steps.check.outputs.day }}"
+        run: python news_wechat/push_sc.py "$PAGE_URL" "${{ steps.check.outputs.day }}" || echo "::warning::ServerChan 推送失败（额度可能耗尽），不影响已生成的产出"
 
       - name: 提交产出（供跨期查重与历史归档）
         if: ${{ steps.check.outputs.skip != 'true' && steps.collect.outcome == 'success' }}
