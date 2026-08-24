@@ -840,6 +840,29 @@ def _timeliness_clause(day, min_n=None):
     )
 
 
+def _anti_hallucination_clause(day, cfg=None):
+    """反幻觉/事实准确性约束（与新闻时效并列的最高优先级）。
+
+    防止模型凭自身记忆「补全」而非严格依据检索素材，导致冠军归属、周年计算、
+    地点型号、政策数字等敏感事实张冠李戴或被夸大。针对 2026-08-24 核查发现的
+    「凭记忆写旧赛事夺冠/张冠李戴」「凭记忆写周年数」「发射地点记忆错位」
+    「橙色预警写成40℃以上(夸大)」等问题。
+    """
+    return (
+        "【事实准确性·最高优先级】所有具体事实必须严格源自上方检索素材，严禁凭自身记忆编造或补全：\n"
+        "① 冠军归属/奖项得主/赛事结果（如「谁夺冠」「某队获几金」）：必须先依据素材确认主体与名次，"
+        "不得把「印象中某队强」写成夺冠；归属张冠李戴视为严重错误，宁可不写也不得臆造。\n"
+        "② 周年/年份/届数计算（如「X周年」「第N届」）：必须以素材中的真实日期为基准推算，"
+        "不得凭记忆写周年数；素材无明确日期时直接省略该表述。\n"
+        "③ 地点/机构/型号/政策数字/统计口径（如发射中心、火箭型号、逆回购金额、旅客发送量）："
+        "必须源自素材，素材未出现的具体数值不得猜测填写。\n"
+        "④ 气象预警类：预警等级与温度数字须与分级标准一致——橙色预警=24h内最高≥37℃、"
+        "红色预警=≥40℃；不得把「橙色」写成「40℃以上」（属夸大），温度数字须与素材中预警原文一致。\n"
+        "⑤ 若素材不足以确认某敏感事实，宁可省略该条，或明确标注「据XX报道」并保留不确定性，"
+        "绝不得用记忆中的「差不多」内容填补。\n"
+    )
+
+
 def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, seed=""):
     """单板块聚焦 prompt：只让模型生成「一个板块」的 items，来源用编号表约束。"""
     d = date.fromisoformat(day)
@@ -907,7 +930,7 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
             "③若与已有板块重复，请换一条不同事件；"
             f"④items 数组长度必须恰好 {sec['min']} 条。"
         )
-    usr_p += "\n" + _timeliness_clause(day, sec["min"])
+    usr_p += "\n" + _timeliness_clause(day, sec["min"]) + "\n" + _anti_hallucination_clause(day, cfg)
     return sys_p, usr_p
 
 
@@ -993,6 +1016,7 @@ def build_batch_prompt(batch, day, cfg, ctx_map, seen_texts=None, errors_map=Non
         usr_p += "\n【去重】以下事件已在其他板块出现，严禁重复或改写后重复：\n- " + "\n- ".join(seen_texts[:8]) + "\n"
     if errors_map:
         usr_p += "\n上一次未通过校验，请修正：\n" + "\n".join(f"- [{k}] " + "; ".join(v) for k, v in errors_map.items())
+    usr_p += "\n" + _anti_hallucination_clause(day, cfg)
     return sys_p, usr_p
 
 
@@ -1227,7 +1251,7 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     )
     if errors:
         usr_p += "\n上一次未通过校验：\n- " + "\n- ".join(errors)
-    usr_p += "\n" + _timeliness_clause(day)
+    usr_p += "\n" + _timeliness_clause(day) + "\n" + _anti_hallucination_clause(day, cfg)
     return sys_p, usr_p
 
 
