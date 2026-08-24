@@ -817,6 +817,29 @@ def _ctx_for_section(search_ctx, sec_name, sec_names):
     return keep
 
 
+def _timeliness_clause(day, min_n=None):
+    """统一的新闻时效约束文本，三处 prompt 复用，保证强度一致且可被模型重点遵守。
+
+    核心：本期日期当天及前一日才可用，任何更早的旧闻一律禁用，且禁止把旧闻
+    改写成「近日/近期」伪装成新近新闻。素材无法确认时效时宁可弃用、宁缺毋滥。
+    """
+    d = date.fromisoformat(day)
+    date_cn = f"{d.year}年{d.month}月{d.day}日 星期{WEEKDAYS[d.weekday()]}"
+    prev = d - timedelta(days=1)
+    prev_cn = f"{prev.year}年{prev.month}月{prev.day}日"
+    min_txt = (
+        f"（若时效窗口内真实新闻不足 {min_n} 条，宁可少出，绝不用旧闻凑数）"
+        if min_n else ""
+    )
+    return (
+        f"【新闻时效·最高优先级】本期日期 {date_cn}。\n"
+        f"① 仅可采用「{date_cn}」当天及前一日（{prev_cn}）真实发生的新闻事件。\n"
+        f"② 严禁采用任何更早日期的新闻；严禁把旧闻改写为「近日/近期/日前/日前消息」等模糊表述伪装成新近新闻。\n"
+        f"③ 明确禁用的旧闻类型：周年纪念、历史回顾、往届赛事与旧影视剧集、已闭幕或结束的会议活动、过往政策旧闻、旧榜单旧数据。\n"
+        f"④ 若检索素材中某条无法确认发生在时效窗口内，必须直接弃用，不得强行成稿{min_txt}。\n"
+    )
+
+
 def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, seed=""):
     """单板块聚焦 prompt：只让模型生成「一个板块」的 items，来源用编号表约束。"""
     d = date.fromisoformat(day)
@@ -828,7 +851,8 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
         "规则 1：每条 text 为 20–60 个汉字的客观陈述句，不评论不引申；"
         "不足 20 字必须补充时间/地点/主体/影响等真实细节扩写。\n"
         "规则 2：每条 source_idx 必须是下面「来源编号表」中的某个序号（整数），不可写表外的媒体名。\n"
-        "规则 3：所有新闻须为 " + date_cn + " 当天或前一日真实发生的新近新闻，不用旧闻/周年/历史回顾。\n"
+        "规则 3：新闻时效为最高优先级，严格只用 " + date_cn + " 当天及前一日真实发生的新近新闻，"
+        "严禁任何旧闻/周年纪念/历史回顾/旧赛事翻新（细节见下方「新闻时效条款」）。\n"
         "规则 4：同一板块内的各条新闻必须覆盖不同事件/不同主体，绝不允许同主题连续出现。\n"
         "规则 5：text 必须以汉字/数字/字母开头，不得以逗号、顿号、句号等标点符号开头。\n"
         "规则 6：只输出 JSON，不要任何解释文字、不要 markdown 代码块。\n"
@@ -883,6 +907,7 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
             "③若与已有板块重复，请换一条不同事件；"
             f"④items 数组长度必须恰好 {sec['min']} 条。"
         )
+    usr_p += "\n" + _timeliness_clause(day, sec["min"])
     return sys_p, usr_p
 
 
@@ -931,7 +956,8 @@ def build_batch_prompt(batch, day, cfg, ctx_map, seen_texts=None, errors_map=Non
         "你是《报简说》日报编辑。本次需一次性输出多个新闻板块的摘要，严格遵守规则：\n"
         "规则 1：每条 text 为 20–60 个汉字的客观陈述句，不评论不引申；不足 20 字必须补充真实细节扩写。\n"
         "规则 2：每条 source_idx 必须是该板块「来源编号表」中的序号（整数），不可写表外媒体名。\n"
-        "规则 3：所有新闻须为 " + date_cn + " 当天或前一日真实发生的新近新闻，不用旧闻。\n"
+        "规则 3：新闻时效最高优先级，严格只用 " + date_cn + " 当天及前一日真实发生的新近新闻，"
+        "严禁旧闻/周年/历史回顾/旧赛事翻新（细节见下方「新闻时效条款」）。\n"
         "规则 4：同一板块内各条须覆盖不同事件/主体，绝不允许同主题连续出现。\n"
         "规则 5：text 必须以汉字/数字/字母开头，不得以标点符号开头。\n"
         "规则 6：只输出 JSON，不要任何解释、不要 markdown 代码块。\n"
@@ -949,6 +975,7 @@ def build_batch_prompt(batch, day, cfg, ctx_map, seen_texts=None, errors_map=Non
             f"覆盖 {sec['min']} 个不同事件，每条 {cfg['item_char_min']}-{cfg['item_char_max']} 字。\n"
             f"该板块可用检索素材：\n{ctx_txt}\n"
         )
+    sys_p += "\n" + _timeliness_clause(day)
     sys_p += "各板块定义如下：\n" + "\n".join(blocks)
     usr_p = (
         "请输出如下 JSON（sections 数组，顺序与上面板块一致）：\n"
@@ -1172,7 +1199,7 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
         "每条只写话题标题（简短，≤20字），site 只能是给定热榜站点之一。\n"
         "2. interaction 每期只出 1 个高质量问题，靠读者打字留言参与，"
         "绝不做成按钮、绝不允许出现「点赞/在看/转发/分享/抽奖/奖品」等词。\n"
-        "3. 只输出 JSON，不要解释。\n"
+        "3. 热点榜单话题必须是 " + day + " 当天真实在榜的热门话题，严禁旧热搜、旧事件翻新、过季节日活动等过期内容；只输出 JSON，不要解释。\n"
     )
     usr_p = (
         f"请生成 {day}（{date_cn}）的热点榜单与每日一问。\n"
@@ -1200,6 +1227,7 @@ def build_meta_prompt(day, cfg, prev_type, search_ctx, errors, seed=""):
     )
     if errors:
         usr_p += "\n上一次未通过校验：\n- " + "\n- ".join(errors)
+    usr_p += "\n" + _timeliness_clause(day)
     return sys_p, usr_p
 
 
