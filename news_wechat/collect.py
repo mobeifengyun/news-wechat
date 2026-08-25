@@ -461,12 +461,15 @@ LIVE_SEARCH_DIRECTIVE = (
 )
 
 
-def deepseek_responses_chat(system, user, base_url, api_key, model, max_tokens=2048):
+def deepseek_responses_chat(system, user, base_url, api_key, model, max_tokens=2048,
+                            enable_search=True, reasoning_effort="low"):
     """DeepSeek Responses API + 服务端 web_search（原生联网搜索）。
 
     - web_search 工具仅 /responses 端点可用；/chat/completions 会 400 拒绝。
     - DeepSeek Responses 端点不带 /v1 前缀（base_url 经 _normalize_base_url 已补 /v1，这里还原）。
     - 返回模型最终文本（通常含 JSON，由调用方自行提取）。
+    - enable_search=False 时纯生成（不触发 web_search），用于复用已集中采集的素材，大幅省 token。
+    - reasoning_effort="low" 关闭高推理：思考 token 按输出价计费，是主要成本黑洞，关闭可省 50%+。
     """
     import requests
 
@@ -474,17 +477,19 @@ def deepseek_responses_chat(system, user, base_url, api_key, model, max_tokens=2
     if base.endswith("/v1"):
         base = base[:-3]
     url = base + "/responses"
-    print(f"  deepseek_responses_chat: model={model} url={url}")
+    print(f"  deepseek_responses_chat: model={model} url={url} search={enable_search} effort={reasoning_effort}")
     body = {
         "model": model,
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "tools": [{"type": "web_search"}],
-        "tool_choice": {"type": "web_search"},  # 强制联网搜索
         "max_tokens": max_tokens,
+        "reasoning": {"effort": reasoning_effort},
     }
+    if enable_search:
+        body["tools"] = [{"type": "web_search"}]
+        body["tool_choice"] = {"type": "web_search"}  # 强制联网搜索
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -501,6 +506,45 @@ def deepseek_responses_chat(system, user, base_url, api_key, model, max_tokens=2
                     text += c.get("text", "")
     print(f"  deepseek_responses_chat: 返回 {len(text)} 字符")
     return text
+
+
+# ---------------- DeepSeek 集中采集（省 token 关键） ----------------
+# 用可变容器透传采集素材，避免改动一长串函数签名。
+DEEPSEEK_STATE = {"material": None}
+
+
+def _deepseek_collect_material(day, cfg, providers):
+    """DeepSeek 原生搜索：一次性集中采集当天全板块真实新闻素材。
+
+    返回纯文本素材（供后续 batch/热点生成复用，避免每板块重复联网搜索）。
+    失败返回 None，调用方回退为「每板块各自搜索」旧模式。
+    """
+    d = date.fromisoformat(day)
+    date_cn = f"{d.year}年{d.month}月{d.day}日"
+    sec_names = "、".join(s["name"] for s in cfg["sections"])
+    wl = "、".join(cfg["source_whitelist"][:16])  # 精简白名单，避免 prompt 超长
+    prompt = (
+        f"你是新闻采集助手。请联网搜索 {date_cn}（含前一日）中国及全球真实发生的新闻。"
+        f"必须覆盖以下板块：{sec_names}。\n"
+        f"对每个板块，列出 4-6 条最重要、可核实的新闻，每条一行，格式严格为：\n"
+        f"【板块名】新闻要点（一句话，含具体时间、地点、主体、数字）— 来源媒体名\n"
+        f"来源必须限定在权威白名单媒体（如：{wl} 等）。\n"
+        f"严禁编造、严禁旧闻翻新或周年纪念类内容；无法确认时效的不要列。\n"
+        f"只输出新闻清单，不要 JSON、不要解释、不要额外标题。"
+    )
+    system = "你是专业新闻采集助手，擅长中文新闻检索与核实，输出简洁、来源可靠。"
+    for provider in providers:
+        try:
+            raw = deepseek_responses_chat(
+                system, prompt, provider["base_url"], provider["api_key"],
+                provider["models"][0], enable_search=True, reasoning_effort="low")
+            if raw and len(raw) > 120:
+                return raw
+            print("  集中采集返回过短，视为失败")
+        except Exception as e:
+            print("  集中采集失败:", e)
+            continue
+    return None
 
 
 # ---------------- 速率限制（应对免费模型低 RPM 限流） ----------------
@@ -1814,10 +1858,12 @@ def _generate_once(provider, system, user, use_tavily, use_kimi, search_mode):
             if provider["kind"] == "kimi":
                 return kimi_chat(system, user, provider["base_url"], provider["api_key"], model)
             if search_mode == "deepseek" and "deepseek.com" in provider["base_url"]:
-                # DeepSeek 原生联网搜索：让模型自己搜+生成，不再依赖 Tavily
+                # DeepSeek 原生联网搜索：若已集中采集素材则纯生成复用（省 token），
+                # 否则强制 web_search 自行获取素材（回退模式）。
                 return deepseek_responses_chat(
                     system + LIVE_SEARCH_DIRECTIVE, user,
-                    provider["base_url"], provider["api_key"], model)
+                    provider["base_url"], provider["api_key"], model,
+                    enable_search=not bool(DEEPSEEK_STATE["material"]))
             tools = None
             if ("googleapis.com" in provider["base_url"]
                     and not use_tavily and not use_kimi and search_mode != "none"):
@@ -2280,8 +2326,18 @@ def main():
     )
 
     if use_deepseek_search:
-        print("检索模式：DeepSeek 原生 web_search（服务端联网搜索，无需 Tavily，模型自己搜+生成）")
-        # search_ctx 留空：素材由 DeepSeek 在生成时通过 web_search 自行获取
+        # 优化：先集中采集一次素材（1 次 web_search），后续所有板块/热点复用该素材纯生成，
+        # 把 4+ 次独立联网搜索收敛为 1 次，配合 thinking=low 大幅降低 token 消耗。
+        print("检索模式：DeepSeek 原生 web_search（集中采集 + 复用，省 token）")
+        material = _deepseek_collect_material(day, cfg, providers)
+        if material:
+            print(f"  ✅ 集中采集素材成功（{len(material)} 字），后续生成复用、不再各自搜索")
+            DEEPSEEK_STATE["material"] = material
+            search_ctx = [material]
+        else:
+            print("  ⚠ 集中采集失败，回退为每板块各自联网搜索")
+            DEEPSEEK_STATE["material"] = None
+            search_ctx = []
     elif use_kimi:
         print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model_display}")
     elif use_tavily:
@@ -2376,7 +2432,11 @@ def main():
             for provider in providers:
                 print(f"\n▶ 批次{bi // BATCH + 1} [{'/'.join(s['name'] for s in batch)}] 尝试 {provider['name']}")
                 try:
-                    batch_ctx = {s["name"]: _ctx_for_section(search_ctx, s["name"], sec_names) for s in batch}
+                    if DEEPSEEK_STATE["material"]:
+                        # 复用集中采集素材：每批次都拿到全量素材，由模型按本批板块筛选
+                        batch_ctx = {s["name"]: [DEEPSEEK_STATE["material"]] for s in batch}
+                    else:
+                        batch_ctx = {s["name"]: _ctx_for_section(search_ctx, s["name"], sec_names) for s in batch}
                     sys_p, usr_p = build_batch_prompt(batch, day, cfg, batch_ctx, seen_texts, {}, seed)
                     raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
                     parsed = _extract_batch_items(raw, batch, cfg)
@@ -2387,7 +2447,7 @@ def main():
                     items = parsed[k] if k < len(parsed) else []
                     if not items:
                         continue
-                    ctx = _ctx_for_section(search_ctx, sec["name"], sec_names)
+                    ctx = [DEEPSEEK_STATE["material"]] if DEEPSEEK_STATE["material"] else _ctx_for_section(search_ctx, sec["name"], sec_names)
                     items = _expand_short_items(items, provider, sec, cfg)
                     items = _dedup_items(items, seen_texts)
                     errs = _validate_section(items, sec, cfg)
@@ -2402,10 +2462,10 @@ def main():
                        for k in range(len(batch))):
                     break
             # 本批次结束：空/不足板块单板块补生成，仍不足走板块级兜底
-            for k, sec in enumerate(batch):
-                items = batch_items[k] or []
-                ctx = _ctx_for_section(search_ctx, sec["name"], sec_names)
-                if len(items) < sec["min"]:
+        for k, sec in enumerate(batch):
+            items = batch_items[k] or []
+            ctx = [DEEPSEEK_STATE["material"]] if DEEPSEEK_STATE["material"] else _ctx_for_section(search_ctx, sec["name"], sec_names)
+            if len(items) < sec["min"]:
                     print(f"\n▶ [{sec['name']}] 分批不足，单板块补生成")
                     for provider in providers:
                         try:
@@ -2417,13 +2477,13 @@ def main():
                         except Exception as e:
                             print("  单板块补生成失败:", e)
                             continue
-                if len(items) < sec["min"]:
-                    print(f"⚠ [{sec['name']}] 仍不足，板块级兜底")
-                    items = _section_fallback(sec, search_ctx, cfg, day)
-                items = _dedup_items(items, seen_texts)
-                print(f"✅ [{sec['name']}] 成稿 {len(items)} 条")
-                sections_out.append({"name": sec["name"], "items": items})
-                seen_texts.extend(it["text"] for it in items)
+                    if len(items) < sec["min"]:
+                        print(f"⚠ [{sec['name']}] 仍不足，板块级兜底")
+                        items = _section_fallback(sec, search_ctx, cfg, day)
+                    items = _dedup_items(items, seen_texts)
+                    print(f"✅ [{sec['name']}] 成稿 {len(items)} 条")
+                    sections_out.append({"name": sec["name"], "items": items})
+                    seen_texts.extend(it["text"] for it in items)
     
         # -------- meta：热点榜单 + 每日一问（独立聚焦 prompt） --------
         meta = None
