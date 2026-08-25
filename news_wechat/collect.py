@@ -354,8 +354,16 @@ def _source_from_url(url):
     return ""
 
 
-def tavily_search(query, api_key, max_results=5, days=2):
-    """Tavily 检索；严格条件无结果时自动放宽重试，确保拿到当日素材。"""
+def tavily_search(query, api_key, max_results=5, days=1):
+    """Tavily 检索（中文新闻专用配置）。
+
+    关键配置（此前 0 条的根因已修复）：
+    - time_range="day"：铁律，仅搜最近 24 小时（Tavily 无 days 参数，旧代码传 days 被忽略）
+    - country="china" + language="zh-cn" + filter_by_language=True：确保中文召回
+      （不设置时 Tavily 默认英文索引优先，中文新闻在白名单域名上几乎 0 命中）
+    - include_domains：白名单锁来源
+    三级降级：全白名单 → 核心央媒 → 放开域名（仍按 URL 过滤白名单）
+    """
     import requests
 
     def _call(payload):
@@ -382,32 +390,33 @@ def tavily_search(query, api_key, max_results=5, days=2):
             out.append(f"【{title}】{content}\n来源: {src}")
         return out
 
-    base_payload = {
+    base = {
         "api_key": api_key,
         "query": query,
         "max_results": max_results,
         "search_depth": "advanced",
         "topic": "news",
-        "days": days,
-        # 注意：Tavily 的 time_range 与 days 不建议同时用；
-        # time_range="day" 只会搜最近 24h，配合大量 include_domains 极易 0 条。
-        # 这里用 days 控制时效，搜索范围更宽、召回更稳。
+        "time_range": "day",          # 铁律：仅最近 24 小时
+        "country": "china",           # 中文召回关键
+        "language": "zh-cn",          # 中文召回关键
+        "filter_by_language": True,   # 只取中文结果
     }
 
-    # 第 1 轮：限定白名单域名 + 近 N 天
-    strict = _call({**base_payload, "include_domains": ALL_WL_DOMAINS})
+    # 第 1 轮：全部白名单域名
+    strict = _call({**base, "include_domains": ALL_WL_DOMAINS})
     if strict:
         return _format(strict)
 
-    # 第 2 轮：去掉 include_domains，仅保留核心央媒域名，避免 60+ 域名同时限制导致召回失败
+    # 第 2 轮：核心央媒域名（更短列表，召回更稳）
     core_domains = ["xinhuanet.com", "news.cn", "people.com.cn", "cctv.com", "cntv.cn", "cctv.cn",
-                    "chinanews.com.cn", "thepaper.cn", "yicai.com", "stcn.com", "huanqiu.com"]
-    core = _call({**base_payload, "include_domains": core_domains, "max_results": max_results * 2})
+                    "chinanews.com.cn", "thepaper.cn", "yicai.com", "stcn.com", "huanqiu.com",
+                    "gov.cn", "moe.gov.cn", "mct.gov.cn", "sport.gov.cn"]
+    core = _call({**base, "include_domains": core_domains, "max_results": max_results * 2})
     if core:
         return _format(core)
 
-    # 第 3 轮：完全放开域名，拿到结果后再按 URL 过滤白名单
-    broad = _call(base_payload)
+    # 第 3 轮：放开域名，但保留语言过滤；_format 仍按 URL 过滤白名单来源
+    broad = _call(base)
     return _format(broad)
 
 
