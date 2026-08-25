@@ -979,16 +979,17 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
         f"围绕{sec['name']}领域的热点话题持续引发讨论，专家呼吁保持理性关注权威信息。",
         f"{date_cn.split('日')[0]}日晚间，{sec['name']}板块传出最新消息，相关方正加紧推进后续工作。",
     ]
-    for i in range(sec["min"]):
+    for i in range(sec["max"]):
         eg = eg_texts[i % len(eg_texts)]
         example_lines.append(f'    {{"text": "{eg}", "source_idx": {i % len(srcs)}}}')
     example_block = ",\n".join(example_lines)
 
     usr_p = (
         f"请生成「{sec['name']}」板块。要求如下：\n"
-        f"• 输出 items 数组，数组长度必须恰好为 {sec['min']} 条（不得低于 {sec['min']} 条，也不得高于 {sec['max']} 条）。\n"
+        f"• 输出 items 数组，目标长度为 {sec['max']} 条；若当天真实新闻确实不足，可降为不少于 {sec['min']} 条，"
+        f"但不得低于 {sec['min']} 条、不得高于 {sec['max']} 条。\n"
         f"• 按重要等级从高到低排序；若素材不足，用同板块次重要但真实的当天新闻补足，绝不用旧闻编造。\n"
-        f"• {sec['min']} 条新闻必须覆盖 {sec['min']} 个不同的事件或主体，避免同一话题重复。\n"
+        f"• 输出的每条新闻必须覆盖不同的事件或主体，避免同一话题重复。\n"
         f"• 字数按中文字符计算（含标点符号），每条必须在 {cfg['item_char_min']}-{cfg['item_char_max']} 字之间，"
         f"不足 {cfg['item_char_min']} 字时必须补充具体时间、地点、主体或影响扩写。\n\n"
     )
@@ -1003,7 +1004,7 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
         + ("\n\n".join(ctx_for_sec)[:3500] if ctx_for_sec
            else "（当前检索素材为空，请基于当天该领域真实可信的公开信息概括成稿，来源须选自编号表）")
         + "\n\n"
-        f"输出 schema（items 数组长度必须恰好为 {sec['min']} 条，示例已给出 {sec['min']} 条，请严格替换为真实新闻）：\n"
+        f"输出 schema（items 数组目标 {sec['max']} 条、下限 {sec['min']} 条，示例已给出 {sec['max']} 条，请严格替换为真实新闻）：\n"
         "{\n"
         '  "items": [\n'
         + example_block + "\n"
@@ -1016,7 +1017,7 @@ def build_section_prompt(sec, day, cfg, ctx_for_sec, errors, seen_texts=None, se
             f"\n修正：①字数不足就补充真实细节扩写到 {cfg['item_char_min']} 字以上；"
             "②source_idx 必须取上面编号表中的序号（整数），不得写表外媒体名；"
             "③若与已有板块重复，请换一条不同事件；"
-            f"④items 数组长度必须恰好 {sec['min']} 条。"
+            f"④items 数组长度目标 {sec['max']} 条、下限 {sec['min']} 条（不足 {sec['min']} 条需补足真实新闻）。"
         )
     usr_p += "\n" + _timeliness_clause(day, sec["min"]) + "\n" + _anti_hallucination_clause(day, cfg)
     return sys_p, usr_p
@@ -1082,8 +1083,8 @@ def build_batch_prompt(batch, day, cfg, ctx_map, seen_texts=None, errors_map=Non
         blocks.append(
             f"【板块 {sec['name']}】\n"
             f"该板块来源编号表：\n{src_list}\n"
-            f"要求：输出 items 数组，长度恰好 {sec['min']} 条（不低于 {sec['min']}），"
-            f"覆盖 {sec['min']} 个不同事件，每条 {cfg['item_char_min']}-{cfg['item_char_max']} 字。\n"
+            f"要求：输出 items 数组，目标长度 {sec['max']} 条、下限 {sec['min']} 条（不低于 {sec['min']}），"
+            f"覆盖不同事件，每条 {cfg['item_char_min']}-{cfg['item_char_max']} 字。\n"
             f"该板块可用检索素材：\n{ctx_txt}\n"
         )
     sys_p += "\n" + _timeliness_clause(day)
@@ -1093,8 +1094,10 @@ def build_batch_prompt(batch, day, cfg, ctx_map, seen_texts=None, errors_map=Non
         "{\n  \"sections\": [\n"
         + ",\n".join(
             '    {\n      "name": "' + sec["name"] + '",\n      "items": [\n'
-            '        {"text": "（替换为真实新闻摘要）", "source_idx": 0}'
-            + (",\n        {\"text\": \"...\", \"source_idx\": 1}" if sec["min"] > 1 else "")
+            + ",\n".join(
+                '        {"text": "（替换为真实新闻摘要）", "source_idx": %d}' % i
+                for i in range(sec["max"])
+            )
             + "\n      ]\n    }"
             for sec in batch
         )
