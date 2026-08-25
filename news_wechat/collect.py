@@ -451,6 +451,58 @@ def llm_chat(system, user, base_url, api_key, model, tools=None):
     return content
 
 
+# DeepSeek 原生联网搜索指令（仅在 search_mode=deepseek 时注入 system）
+# 关键：DeepSeek 的 web_search 只在 /responses 端点可用，/chat/completions 会 400 拒绝。
+LIVE_SEARCH_DIRECTIVE = (
+    "\n【联网搜索强制要求】你具备服务端联网搜索（web_search）能力，生成前必须先调用 web_search "
+    "检索「当天及前一日」真实发生的新闻；所有内容必须来自搜索到的白名单媒体来源，"
+    "严禁凭训练记忆编造、严禁旧闻翻新或周年纪念类内容。若某板块当天确无足够真实新闻，"
+    "宁可少写几条也不要虚构或引用过期信息。\n"
+)
+
+
+def deepseek_responses_chat(system, user, base_url, api_key, model, max_tokens=2048):
+    """DeepSeek Responses API + 服务端 web_search（原生联网搜索）。
+
+    - web_search 工具仅 /responses 端点可用；/chat/completions 会 400 拒绝。
+    - DeepSeek Responses 端点不带 /v1 前缀（base_url 经 _normalize_base_url 已补 /v1，这里还原）。
+    - 返回模型最终文本（通常含 JSON，由调用方自行提取）。
+    """
+    import requests
+
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = base + "/responses"
+    print(f"  deepseek_responses_chat: model={model} url={url}")
+    body = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "tools": [{"type": "web_search"}],
+        "tool_choice": {"type": "web_search"},  # 强制联网搜索
+        "max_tokens": max_tokens,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    r = _post_with_retry(url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    r.raise_for_status()
+    resp = r.json()
+    # 最终文本：优先 output_text 便捷字段，否则遍历 output 收集所有 output_text
+    text = resp.get("output_text") or ""
+    if not text:
+        for item in resp.get("output", []) or []:
+            for c in item.get("content", []) or []:
+                if c.get("type") == "output_text" and c.get("text"):
+                    text += c.get("text", "")
+    print(f"  deepseek_responses_chat: 返回 {len(text)} 字符")
+    return text
+
+
 # ---------------- 速率限制（应对免费模型低 RPM 限流） ----------------
 import threading as _threading
 _rpm_lock = _threading.Lock()
@@ -1758,6 +1810,11 @@ def _generate_once(provider, system, user, use_tavily, use_kimi, search_mode):
         try:
             if provider["kind"] == "kimi":
                 return kimi_chat(system, user, provider["base_url"], provider["api_key"], model)
+            if search_mode == "deepseek" and "deepseek.com" in provider["base_url"]:
+                # DeepSeek 原生联网搜索：让模型自己搜+生成，不再依赖 Tavily
+                return deepseek_responses_chat(
+                    system + LIVE_SEARCH_DIRECTIVE, user,
+                    provider["base_url"], provider["api_key"], model)
             tools = None
             if ("googleapis.com" in provider["base_url"]
                     and not use_tavily and not use_kimi and search_mode != "none"):
@@ -2211,15 +2268,21 @@ def main():
     print(f"采集 {day}（上期卡型={prev_type or '无'}）主模型={model_display}；供应商数={len(providers)}")
 
     search_ctx = []
-    use_tavily = (search_mode == "tavily") or (tavily_key and search_mode != "none")
+    # 检索模式分流：deepseek 原生搜索优先，其次 kimi/tavily，最后 gemini
+    use_deepseek_search = (search_mode == "deepseek")
+    use_tavily = (search_mode == "tavily") or (
+        tavily_key and search_mode not in ("deepseek", "kimi", "none"))
     use_kimi = (search_mode == "kimi") or (
-        "moonshot" in base_url and not use_tavily and search_mode != "none"
+        "moonshot" in base_url and not use_tavily and not use_deepseek_search and search_mode != "none"
     )
 
-    if use_kimi:
+    if use_deepseek_search:
+        print("检索模式：DeepSeek 原生 web_search（服务端联网搜索，无需 Tavily，模型自己搜+生成）")
+        # search_ctx 留空：素材由 DeepSeek 在生成时通过 web_search 自行获取
+    elif use_kimi:
         print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model_display}")
     elif use_tavily:
-        print("检索模式：Tavily（限定白名单域名 + 近 2 日新闻）")
+        print("检索模式：Tavily（限定白名单域名 + 近 24 小时新闻）")
         _d = date.fromisoformat(day)
         _dc = f"{_d.year}年{_d.month}月{_d.day}日"
         queries = [
