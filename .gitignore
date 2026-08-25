@@ -13,5 +13,8 @@ news_wechat/output/_pending_catchup.json
 # 公众号参考素材（用户手动喂入的原文，含第三方内容，绝不入库；仅 README 跟踪）
 news_wechat/seeds/*.txt
 
+# 本地密钥（用户粘贴的 DeepSeek key，绝不入库）
+news_wechat/key.txt
+
 # WorkBuddy 本地数据
 .workbuddy/
