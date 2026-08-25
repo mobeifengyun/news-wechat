@@ -355,33 +355,60 @@ def _source_from_url(url):
 
 
 def tavily_search(query, api_key, max_results=5, days=2):
+    """Tavily 检索；严格条件无结果时自动放宽重试，确保拿到当日素材。"""
     import requests
-    r = requests.post(
-        "https://api.tavily.com/search",
-        json={
-            "api_key": api_key,
-            "query": query,
-            "max_results": max_results,
-            "include_domains": ALL_WL_DOMAINS,
-            "search_depth": "advanced",
-            "topic": "news",
-            "days": days,
-            "time_range": "day",
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    res = r.json().get("results", [])
-    out = []
-    for it in res:
-        title = it.get("title", "")
-        content = it.get("content", "")
-        url = it.get("url", "")
-        # 素材预处理：把原始 url 直接归一化为白名单规范来源名，
-        # 模型拿到的素材即带规范来源，从根上减少来源归属混乱。
-        src = _source_from_url(url) or url
-        out.append(f"【{title}】{content}\n来源: {src}")
-    return out
+
+    def _call(payload):
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json=payload,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json().get("results", [])
+
+    def _format(results):
+        out = []
+        for it in results:
+            title = it.get("title", "")
+            content = it.get("content", "")
+            url = it.get("url", "")
+            if not title or not content:
+                continue
+            # 兜底搜索时可能混入非白名单域名，按 URL 过滤只保留白名单来源
+            src = _source_from_url(url)
+            if not src:
+                continue
+            out.append(f"【{title}】{content}\n来源: {src}")
+        return out
+
+    base_payload = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "advanced",
+        "topic": "news",
+        "days": days,
+        # 注意：Tavily 的 time_range 与 days 不建议同时用；
+        # time_range="day" 只会搜最近 24h，配合大量 include_domains 极易 0 条。
+        # 这里用 days 控制时效，搜索范围更宽、召回更稳。
+    }
+
+    # 第 1 轮：限定白名单域名 + 近 N 天
+    strict = _call({**base_payload, "include_domains": ALL_WL_DOMAINS})
+    if strict:
+        return _format(strict)
+
+    # 第 2 轮：去掉 include_domains，仅保留核心央媒域名，避免 60+ 域名同时限制导致召回失败
+    core_domains = ["xinhuanet.com", "news.cn", "people.com.cn", "cctv.com", "cntv.cn", "cctv.cn",
+                    "chinanews.com.cn", "thepaper.cn", "yicai.com", "stcn.com", "huanqiu.com"]
+    core = _call({**base_payload, "include_domains": core_domains, "max_results": max_results * 2})
+    if core:
+        return _format(core)
+
+    # 第 3 轮：完全放开域名，拿到结果后再按 URL 过滤白名单
+    broad = _call(base_payload)
+    return _format(broad)
 
 
 # ---------------- 大模型 ----------------
