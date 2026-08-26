@@ -508,26 +508,51 @@ def deepseek_responses_chat(system, user, base_url, api_key, model, max_tokens=2
     return text
 
 
-# ---------------- DeepSeek 集中采集（省 token 关键） ----------------
-# 用可变容器透传采集素材，避免改动一长串函数签名。
-DEEPSEEK_STATE = {"material": None}
+# ---------------- DeepSeek 按 batch 集中采集（省 token 与质量平衡） ----------------
+# 一次性覆盖全部 6 板块会导致素材严重稀释（实测 1995 字不够分），
+# 改为每个 batch（1-2 个板块）单独采集，素材更聚焦；失败则让生成步骤自行联网搜索。
 
 
-def _deepseek_collect_material(day, cfg, providers):
-    """DeepSeek 原生搜索：一次性集中采集当天全板块真实新闻素材。
+def _split_material_by_section(material, sections):
+    """把混排素材按【板块名】切分，返回 {section_name: [content]}。
 
-    返回纯文本素材（供后续 batch/热点生成复用，避免每板块重复联网搜索）。
-    失败返回 None，调用方回退为「每板块各自搜索」旧模式。
+    集中采集返回的素材是多个板块混排（如 【国内要闻】...【国际新闻】...），
+    直接整段塞进每个板块会让模型难以聚焦，切分后每个板块只看自己的素材。
+    """
+    if not material:
+        return {}
+    sec_names = [s["name"] for s in sections]
+    names_re = "|".join(re.escape(n) for n in sec_names)
+    parts = re.split(rf"【(?:{names_re})】", material)
+    # re.split 会把匹配到的分隔符也作为单独元素插入
+    result = {n: [] for n in sec_names}
+    current = None
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part in sec_names:
+            current = part
+        elif current:
+            result[current].append(part)
+    return {n: ["\n".join(v)] if v else [] for n, v in result.items()}
+
+
+def _deepseek_collect_material(day, cfg, providers, sections=None):
+    """DeepSeek 原生搜索：按 batch 集中采集 1-2 个板块素材。
+
+    避免一次性覆盖全部 6 板块导致素材稀释；每次只聚焦当前 batch 的板块。
+    返回纯文本素材（供当前 batch 生成复用）；失败返回 None，调用方启用搜索生成。
     """
     d = date.fromisoformat(day)
     date_cn = f"{d.year}年{d.month}月{d.day}日"
-    sec_names = "、".join(s["name"] for s in cfg["sections"])
+    target_secs = sections or cfg["sections"]
+    sec_names = "、".join(s["name"] for s in target_secs)
     wl = "、".join(cfg["source_whitelist"][:16])  # 精简白名单，避免 prompt 超长
     prompt = (
-        f"你是新闻采集助手。请联网搜索 {date_cn}（含前一日）中国及全球真实发生的新闻。"
-        f"必须覆盖以下板块：{sec_names}。\n"
-        f"对每个板块，列出 4-6 条最重要、可核实的新闻，每条一行，格式严格为：\n"
-        f"【板块名】新闻要点（一句话，含具体时间、地点、主体、数字）— 来源媒体名\n"
+        f"你是新闻采集助手。请联网搜索 {date_cn}（含前一日）与以下板块相关的真实新闻：{sec_names}。\n"
+        f"对每个板块，列出 6-8 条最重要、可核实的新闻，每条包含具体时间、地点、主体、关键数字、来源媒体名。\n"
+        f"格式严格为：【板块名】新闻要点（一句话）— 来源媒体名\n"
         f"来源必须限定在权威白名单媒体（如：{wl} 等）。\n"
         f"严禁编造、严禁旧闻翻新或周年纪念类内容；无法确认时效的不要列。\n"
         f"只输出新闻清单，不要 JSON、不要解释、不要额外标题。"
@@ -539,6 +564,7 @@ def _deepseek_collect_material(day, cfg, providers):
                 system, prompt, provider["base_url"], provider["api_key"],
                 provider["models"][0], enable_search=True, reasoning_effort="low")
             if raw and len(raw) > 120:
+                print(f"  ✅ 采集到 {len(raw)} 字符素材（{sec_names}）")
                 return raw
             print("  集中采集返回过短，视为失败")
         except Exception as e:
@@ -1204,7 +1230,7 @@ def _expand_short_items(items, provider, sec, cfg):
     )
     user = json.dumps(originals, ensure_ascii=False)
     try:
-        raw = _generate_once(provider, system, user, False, False, "none")
+        raw = _generate_once(provider, system, user, False, False, "none", enable_search=False)
         m = re.search(r"\[.*\]", raw, re.S)
         if not m:
             return items
@@ -1265,7 +1291,8 @@ def _fill_missing_items(existing, missing, sec, day, cfg, ctx_for_sec, seen_text
                              for i in range(current_missing))
                 + "\n  ]\n}\n"
             )
-            raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+            # 补生成缺口必须能重新联网搜索，不能仅基于已有素材硬编
+            raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=True)
             extra = _extract_section_items(raw, srcs)
             extra = [it for it in extra if not _is_meaningless(it.get("text", ""))]
             before = len(merged)
@@ -1848,22 +1875,26 @@ def _build_providers():
     return providers
 
 
-def _generate_once(provider, system, user, use_tavily, use_kimi, search_mode):
-    """用单个供应商的候选模型依次尝试生成；鉴权失败抛 LLMAuthError。"""
+def _generate_once(provider, system, user, use_tavily, use_kimi, search_mode, enable_search=True):
+    """用单个供应商的候选模型依次尝试生成；鉴权失败抛 LLMAuthError。
+
+    enable_search: DeepSeek 模式下是否强制使用原生 web_search。
+    有 batch 素材时设为 False 可省 token；补生成/兜底必须设为 True 以重新联网补救。
+    """
     last_err = None
-    print(f"  _generate_once: kind={provider['kind']} base={provider['base_url']} models={provider['models']}")
+    print(f"  _generate_once: kind={provider['kind']} base={provider['base_url']} models={provider['models']} search={enable_search}")
     for model in provider["models"]:
         print(f"    尝试模型: {model}")
         try:
             if provider["kind"] == "kimi":
                 return kimi_chat(system, user, provider["base_url"], provider["api_key"], model)
             if search_mode == "deepseek" and "deepseek.com" in provider["base_url"]:
-                # DeepSeek 原生联网搜索：若已集中采集素材则纯生成复用（省 token），
-                # 否则强制 web_search 自行获取素材（回退模式）。
+                # DeepSeek 原生联网搜索：调用方显式控制 enable_search。
+                # 禁止再依赖全局状态决定搜索开关，避免素材不足时无法补救。
                 return deepseek_responses_chat(
                     system + LIVE_SEARCH_DIRECTIVE, user,
                     provider["base_url"], provider["api_key"], model,
-                    enable_search=not bool(DEEPSEEK_STATE["material"]))
+                    enable_search=enable_search, reasoning_effort="low")
             tools = None
             if ("googleapis.com" in provider["base_url"]
                     and not use_tavily and not use_kimi and search_mode != "none"):
@@ -2011,6 +2042,19 @@ _NATURAL_FALLBACK = {
         "{date}文体资讯素材不足，当前条目为占位提示，非具体新闻事件。",
     ],
 }
+
+
+def _all_placeholder(items):
+    """判断 items 是否全为'素材不足/暂无更多'类占位条目（无真实新闻）。"""
+    if not items:
+        return True
+    placeholder_hints = ["素材不足", "暂无更多", "占位提示", "公开信息有限", "后续更新",
+                         "不符合选稿标准", "可供选入", "编辑部将于"]
+    for it in items:
+        t = it.get("text", "")
+        if not any(h in t for h in placeholder_hints):
+            return False
+    return True
 
 
 def _is_meaningless(text):
@@ -2326,18 +2370,12 @@ def main():
     )
 
     if use_deepseek_search:
-        # 优化：先集中采集一次素材（1 次 web_search），后续所有板块/热点复用该素材纯生成，
-        # 把 4+ 次独立联网搜索收敛为 1 次，配合 thinking=low 大幅降低 token 消耗。
-        print("检索模式：DeepSeek 原生 web_search（集中采集 + 复用，省 token）")
-        material = _deepseek_collect_material(day, cfg, providers)
-        if material:
-            print(f"  ✅ 集中采集素材成功（{len(material)} 字），后续生成复用、不再各自搜索")
-            DEEPSEEK_STATE["material"] = material
-            search_ctx = [material]
-        else:
-            print("  ⚠ 集中采集失败，回退为每板块各自联网搜索")
-            DEEPSEEK_STATE["material"] = None
-            search_ctx = []
+        # 按 batch 集中采集：每个 batch（2 个板块）单独 web_search，素材更聚焦，
+        # 避免一次覆盖 6 板块导致素材稀释。后续 batch 生成复用该 batch 素材；
+        # 若复用仍不足，单板块补生成会强制重新启用搜索。
+        print("检索模式：DeepSeek 原生 web_search（按 batch 集中采集 + 复用，兼顾质量与 token）")
+        # search_ctx 不再预先填充全局 material，由 batch 循环自行采集
+        search_ctx = []
     elif use_kimi:
         print(f"检索模式：Kimi/Moonshot 内置联网搜索（$web_search）模型={model_display}")
     elif use_tavily:
@@ -2382,7 +2420,8 @@ def main():
                     sys_p, usr_p = build_prompt(day, cfg, prev_type, search_ctx, [], seed)
                     print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                     try:
-                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                        # 整体生成若启用，同样让 DeepSeek 自行联网搜索
+                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=True)
                         last_raw = raw
                         m = re.search(r"\{.*\}", raw, re.S)
                         if m:
@@ -2432,14 +2471,22 @@ def main():
             for provider in providers:
                 print(f"\n▶ 批次{bi // BATCH + 1} [{'/'.join(s['name'] for s in batch)}] 尝试 {provider['name']}")
                 try:
-                    if DEEPSEEK_STATE["material"]:
-                        # 复用集中采集素材：每批次都拿到全量素材，由模型按本批板块筛选
-                        batch_ctx = {s["name"]: [DEEPSEEK_STATE["material"]] for s in batch}
+                    # 为当前 batch 单独采集素材（1 次 web_search 覆盖 2 个板块）
+                    batch_material = _deepseek_collect_material(day, cfg, providers, batch) if use_deepseek_search else None
+                    if batch_material:
+                        split_material = _split_material_by_section(batch_material, batch)
+                        batch_ctx = {s["name"]: split_material.get(s["name"], [batch_material]) for s in batch}
                     else:
                         batch_ctx = {s["name"]: _ctx_for_section(search_ctx, s["name"], sec_names) for s in batch}
                     sys_p, usr_p = build_batch_prompt(batch, day, cfg, batch_ctx, seen_texts, {}, seed)
-                    raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                    # 有 batch 素材时先尝试复用（省 token），无素材则直接搜索
+                    raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=not bool(batch_material))
                     parsed = _extract_batch_items(raw, batch, cfg)
+                    # 若复用素材生成结果为空/全占位，立即启用搜索重跑该 batch
+                    if not parsed or all(len(items) == 0 or _all_placeholder(items) for items in parsed):
+                        print("  复用素材生成不足，启用搜索重新生成该 batch")
+                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=True)
+                        parsed = _extract_batch_items(raw, batch, cfg)
                 except Exception as e:
                     print("  批次生成异常:", e)
                     continue
@@ -2447,7 +2494,7 @@ def main():
                     items = parsed[k] if k < len(parsed) else []
                     if not items:
                         continue
-                    ctx = [DEEPSEEK_STATE["material"]] if DEEPSEEK_STATE["material"] else _ctx_for_section(search_ctx, sec["name"], sec_names)
+                    ctx = [batch_material] if batch_material else _ctx_for_section(search_ctx, sec["name"], sec_names)
                     items = _expand_short_items(items, provider, sec, cfg)
                     items = _dedup_items(items, seen_texts)
                     errs = _validate_section(items, sec, cfg)
@@ -2464,13 +2511,14 @@ def main():
             # 本批次结束：空/不足板块单板块补生成，仍不足走板块级兜底
         for k, sec in enumerate(batch):
             items = batch_items[k] or []
-            ctx = [DEEPSEEK_STATE["material"]] if DEEPSEEK_STATE["material"] else _ctx_for_section(search_ctx, sec["name"], sec_names)
+            ctx = [batch_material] if batch_material else _ctx_for_section(search_ctx, sec["name"], sec_names)
             if len(items) < sec["min"]:
                     print(f"\n▶ [{sec['name']}] 分批不足，单板块补生成")
                     for provider in providers:
                         try:
                             sp, up = build_section_prompt(sec, day, cfg, ctx, [], seen_texts, seed)
-                            raw = _generate_once(provider, sp, up, use_tavily, use_kimi, search_mode)
+                            # 补生成必须启用搜索，否则在素材不足时只能继续输出占位
+                            raw = _generate_once(provider, sp, up, use_tavily, use_kimi, search_mode, enable_search=True)
                             items = _extract_section_items(raw, sec.get("sources") or cfg["source_whitelist"])
                             items = [it for it in items if not _is_meaningless(it.get("text", ""))]
                             break
@@ -2495,7 +2543,7 @@ def main():
                     sys_p, usr_p = build_meta_prompt(day, cfg, prev_type, search_ctx, meta_errs, seed)
                     print(f"  第 {attempt+1} 次生成… prompt_size={len(sys_p)+len(usr_p)} 字符")
                     try:
-                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode)
+                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=True)
                         last_raw = raw
                         cand_meta = _extract_meta(raw, cfg)
                         meta_errs = _validate_meta(cand_meta, cfg)
