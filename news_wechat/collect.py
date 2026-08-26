@@ -2471,22 +2471,12 @@ def main():
             for provider in providers:
                 print(f"\n▶ 批次{bi // BATCH + 1} [{'/'.join(s['name'] for s in batch)}] 尝试 {provider['name']}")
                 try:
-                    # 为当前 batch 单独采集素材（1 次 web_search 覆盖 2 个板块）
-                    batch_material = _deepseek_collect_material(day, cfg, providers, batch) if use_deepseek_search else None
-                    if batch_material:
-                        split_material = _split_material_by_section(batch_material, batch)
-                        batch_ctx = {s["name"]: split_material.get(s["name"], [batch_material]) for s in batch}
-                    else:
-                        batch_ctx = {s["name"]: _ctx_for_section(search_ctx, s["name"], sec_names) for s in batch}
+                    # DeepSeek batch 生成直接启用原生搜索：让模型针对本 batch 的 2 个板块实时联网检索。
+                    # 预采集素材复用方案实测仍会输出"素材不足"占位，故改为按 batch 搜索。
+                    batch_ctx = {s["name"]: _ctx_for_section(search_ctx, s["name"], sec_names) for s in batch}
                     sys_p, usr_p = build_batch_prompt(batch, day, cfg, batch_ctx, seen_texts, {}, seed)
-                    # 有 batch 素材时先尝试复用（省 token），无素材则直接搜索
-                    raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=not bool(batch_material))
+                    raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=True)
                     parsed = _extract_batch_items(raw, batch, cfg)
-                    # 若复用素材生成结果为空/全占位，立即启用搜索重跑该 batch
-                    if not parsed or all(len(items) == 0 or _all_placeholder(items) for items in parsed):
-                        print("  复用素材生成不足，启用搜索重新生成该 batch")
-                        raw = _generate_once(provider, sys_p, usr_p, use_tavily, use_kimi, search_mode, enable_search=True)
-                        parsed = _extract_batch_items(raw, batch, cfg)
                 except Exception as e:
                     print("  批次生成异常:", e)
                     continue
@@ -2494,7 +2484,7 @@ def main():
                     items = parsed[k] if k < len(parsed) else []
                     if not items:
                         continue
-                    ctx = [batch_material] if batch_material else _ctx_for_section(search_ctx, sec["name"], sec_names)
+                    ctx = _ctx_for_section(search_ctx, sec["name"], sec_names)
                     items = _expand_short_items(items, provider, sec, cfg)
                     items = _dedup_items(items, seen_texts)
                     errs = _validate_section(items, sec, cfg)
@@ -2509,10 +2499,10 @@ def main():
                        for k in range(len(batch))):
                     break
             # 本批次结束：空/不足板块单板块补生成，仍不足走板块级兜底
-        for k, sec in enumerate(batch):
-            items = batch_items[k] or []
-            ctx = [batch_material] if batch_material else _ctx_for_section(search_ctx, sec["name"], sec_names)
-            if len(items) < sec["min"]:
+            for k, sec in enumerate(batch):
+                items = batch_items[k] or []
+                ctx = _ctx_for_section(search_ctx, sec["name"], sec_names)
+                if len(items) < sec["min"]:
                     print(f"\n▶ [{sec['name']}] 分批不足，单板块补生成")
                     for provider in providers:
                         try:
@@ -2528,10 +2518,10 @@ def main():
                     if len(items) < sec["min"]:
                         print(f"⚠ [{sec['name']}] 仍不足，板块级兜底")
                         items = _section_fallback(sec, search_ctx, cfg, day)
-                    items = _dedup_items(items, seen_texts)
-                    print(f"✅ [{sec['name']}] 成稿 {len(items)} 条")
-                    sections_out.append({"name": sec["name"], "items": items})
-                    seen_texts.extend(it["text"] for it in items)
+                items = _dedup_items(items, seen_texts)
+                print(f"✅ [{sec['name']}] 成稿 {len(items)} 条")
+                sections_out.append({"name": sec["name"], "items": items})
+                seen_texts.extend(it["text"] for it in items)
     
         # -------- meta：热点榜单 + 每日一问（独立聚焦 prompt） --------
         meta = None
