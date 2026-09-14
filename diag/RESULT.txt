@@ -1,0 +1,149 @@
+========================================================================
+第 0 步 · 当前配置（已绕开 Secret 打码）
+========================================================================
+LLM_BASE_URL : len=24 chars=[h | t | t | p | s | : | / | / | a | p | i | . | d | e | e | p | s | e | e | k | . | c | o | m]
+LLM_MODEL    : len=14 chars=[d | e | e | p | s | e | e | k | - | f | l | a | s | h]
+SEARCH_MODE  : len=8 chars=[d | e | e | p | s | e | e | k]
+API Key      : 已配置 sk-...44ab (35 位)
+
+========================================================================
+第 1 步 · 官方模型清单（GET /models）
+========================================================================
+HTTP 200
+共 2 个：
+    deepseek-flash
+    deepseek-v4-pro
+
+========================================================================
+第 2 步 · 逐模型实测（重点看 是否发生搜索调用 / status / 文本长度）
+========================================================================
+
+------------------------------------------------------------------------
+[A 旧参数(项目现用)] model=deepseek-flash
+    input=list  token=max_tokens  tools=True  tool_choice=True
+   HTTP 200  耗时 2.4s  响应 2515 字节
+   status = completed
+   顶层字段 = ['background', 'completed_at', 'content_filters', 'created_at', 'error', 'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user']
+   output 项：
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=message              status=completed  content=['output_text']
+   提取文本 102 字符   是否发生搜索调用 = False
+   样例: 抱歉，我无法完成这个请求。我没有联网搜索能力，无法核实 2026 年 9 月 13 日当天新华社、央视、人民日报发布的具体新闻，因此不能凭记忆编造标题和摘要。建议你打开上述媒体的官网或客户端查看当日要闻。
+   usage = {"input_tokens": 98, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 225, "output_tokens_details": {"reasoning_tokens": 163}, "total_tokens": 323}
+
+------------------------------------------------------------------------
+[B 新参数(官方正确)] model=deepseek-flash
+    input=list  token=max_output_tokens  tools=True  tool_choice=True
+   HTTP 200  耗时 3.4s  响应 2950 字节
+   status = completed
+   顶层字段 = ['background', 'completed_at', 'content_filters', 'created_at', 'error', 'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user']
+   output 项：
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=message              status=completed  content=['output_text']
+   提取文本 40 字符   是否发生搜索调用 = False
+   样例: 2026年9月13日尚未到来，无法搜索到该日期的真实新闻。请核实日期后重新提问。
+   usage = {"input_tokens": 98, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 320, "output_tokens_details": {"reasoning_tokens": 293}, "total_tokens": 418}
+
+--- deepseek-v4-flash : 官方 /models 清单里没有，跳过
+
+------------------------------------------------------------------------
+[A 旧参数(项目现用)] model=deepseek-v4-pro
+    input=list  token=max_tokens  tools=True  tool_choice=True
+   HTTP 200  耗时 9.7s  响应 5579 字节
+   status = completed
+   顶层字段 = ['background', 'completed_at', 'content_filters', 'created_at', 'error', 'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user']
+   output 项：
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=web_search_call      status=completed  content=[]  action={"type": "search", "queries": ["2026年9月13日 新华社 央视 人民日报 重要新闻", "ws_call_id=call_00_hwlZLmTtGTbGlIcBNwKP6083"]}
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=web_search_call      status=completed  content=[]  action={"type": "search", "queries": ["2026年9月13日 央视新闻 国内", "2026年9月13日 人民日报 要闻", "2026年9月13日 台风 登陆 越南", "ws_call_id=call_01_KXGqvV1uWqsP9ka9kPrZ3185"]}
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=message              status=completed  content=['output_text']
+   提取文本 293 字符   是否发生搜索调用 = True
+   样例: 1. **习近平出席金砖国家领导人第十八次会晤第二阶段会议并发表重要讲话** — 新华社 — 当地时间9月13日上午，习近平在新德里出席金砖国家领导人第十八次会晤第二阶段会议并发表题为《筑牢金砖合作根基 壮大全球南方力量》的重要讲话。  2. **王东峰会见欧盟经济社会委员会主席博兰德** — 新华社 — 全国政协副主席兼秘书长王东峰13日在杭州会见欧盟经济社会委员会主席博兰德，介绍中国减贫经验并就促进中欧交流合作进行交流。  3. **南海热带低压在越南广治省沿海登陆** — 央视新闻 — 今
+   usage = {"input_tokens": 7078, "input_tokens_details": {"cached_tokens": 3456}, "output_tokens": 864, "output_tokens_details": {"reasoning_tokens": 552}, "total_tokens": 7942}
+
+------------------------------------------------------------------------
+[B 新参数(官方正确)] model=deepseek-v4-pro
+    input=list  token=max_output_tokens  tools=True  tool_choice=True
+   HTTP 200  耗时 14.4s  响应 6453 字节
+   status = completed
+   顶层字段 = ['background', 'completed_at', 'content_filters', 'created_at', 'error', 'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user']
+   output 项：
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=web_search_call      status=completed  content=[]  action={"type": "search", "queries": ["2026年9月13日 新华社 重要新闻", "2026年9月13日 央视新闻 人民日报 国内要闻", "ws_call_id=call_00_pwhG1jGDWFjKi98o03Md3147"]}
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=web_search_call      status=completed  content=[]  action={"type": "search", "queries": ["2026年9月13日 国内 新闻 要闻", "2026年9月13日 人民日报 头版", "ws_call_id=call_01_cpJuIjEdox9xOck8dkrH2250"]}
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=web_search_call      status=completed  content=[]  action={"type": "open_page", "url": "http://www.zj.chinanews.com.cn/jzkzj/2026-09-13/detail-ihfizwvu6759848.shtml#ws_call_id=call_02_zkFVJbSqf7yVVzNNlNr13644"}
+      - type=web_search_call      status=completed  content=[]  action={"type": "open_page", "url": "http://news.enorth.com.cn/system/2026/09/13/059759623.shtml#ws_call_id=call_03_LTNJ7HjEwJFBTZ1al9DP6080"}
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=web_search_call      status=completed  content=[]  action={"type": "search", "queries": ["2026年中国国际服务贸易交易会 9月13日 闭幕 新华社 央视", "ws_call_id=call_04_x8UDvEXKjboNqnOdXJdc1364"]}
+      - type=message              status=completed  content=['output_text']
+   提取文本 321 字符   是否发生搜索调用 = True
+   样例: 1. **习近平出席金砖国家领导人第十八次会晤第二阶段会议并发表重要讲话** — 新华社 — 当地时间9月13日，国家主席习近平在新德里出席金砖会晤第二阶段会议，发表题为《筑牢金砖合作根基 壮大全球南方力量》的重要讲话，并宣布中国将于明年接任金砖主席国。  2. **2026年中国国际服务贸易交易会闭幕** — 新华社/央视新闻 — 9月13日服贸会在京闭幕，达成7类共1200余项成果，1830余家企业线下参展、5300余家企业线上参展。  3. **三部门联合印发《数字乡村高质量发展行动计划（
+   usage = {"input_tokens": 16776, "input_tokens_details": {"cached_tokens": 11648}, "output_tokens": 1038, "output_tokens_details": {"reasoning_tokens": 520}, "total_tokens": 17814}
+
+--- deepseek-chat : 官方 /models 清单里没有，跳过
+
+--- deepseek-reasoner : 官方 /models 清单里没有，跳过
+
+========================================================================
+第 3 步 · 对照实验（用 B 新参数，变动其他条件）
+========================================================================
+
+------------------------------------------------------------------------
+[C 不指定 tool_choice] model=deepseek-flash
+    input=str  token=max_output_tokens  tools=True  tool_choice=False
+   HTTP 200  耗时 2.8s  响应 2971 字节
+   status = completed
+   顶层字段 = ['background', 'completed_at', 'content_filters', 'created_at', 'error', 'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user']
+   output 项：
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=message              status=completed  content=['output_text']
+   提取文本 133 字符   是否发生搜索调用 = False
+   样例: 抱歉，我无法完成这个请求。我没有联网搜索功能，无法实时查询新华社、央视、人民日报在2026年9月13日发布的新闻。同时，我的知识截止日期是2026年2月，2026年9月13日尚未发生，我没有任何相关记忆或数据可以依据。因此我无法在不编造的情况下提供该日期的新闻清单。
+   usage = {"input_tokens": 98, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 295, "output_tokens_details": {"reasoning_tokens": 216}, "total_tokens": 393}
+
+------------------------------------------------------------------------
+[D 完全不带 tools] model=deepseek-flash
+    input=str  token=max_output_tokens  tools=False  tool_choice=False
+   HTTP 200  耗时 2.7s  响应 3055 字节
+   status = completed
+   顶层字段 = ['background', 'completed_at', 'content_filters', 'created_at', 'error', 'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user']
+   output 项：
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=message              status=completed  content=['output_text']
+   提取文本 64 字符   是否发生搜索调用 = False
+   样例: 抱歉，我无法完成这个请求。我无法联网搜索，也没有2026年9月13日的真实新闻数据。请提供可核实的来源或允许我使用已有知识回答。
+   usage = {"input_tokens": 98, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 338, "output_tokens_details": {"reasoning_tokens": 298}, "total_tokens": 436}
+
+------------------------------------------------------------------------
+[E input 用字符串] model=deepseek-flash
+    input=str  token=max_output_tokens  tools=True  tool_choice=True
+   HTTP 200  耗时 2.3s  响应 2567 字节
+   status = completed
+   顶层字段 = ['background', 'completed_at', 'content_filters', 'created_at', 'error', 'frequency_penalty', 'id', 'incomplete_details', 'instructions', 'max_output_tokens', 'max_tool_calls', 'metadata', 'model', 'moderation', 'object', 'output', 'parallel_tool_calls', 'presence_penalty', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention', 'reasoning', 'safety_identifier', 'service_tier', 'status', 'store', 'temperature', 'text', 'tool_choice', 'tools', 'top_logprobs', 'top_p', 'truncation', 'usage', 'user']
+   output 项：
+      - type=reasoning            status=completed  content=['reasoning_text']
+      - type=message              status=completed  content=['output_text']
+   提取文本 120 字符   是否发生搜索调用 = False
+   样例: 抱歉，我无法完成这个请求。我的知识截止到 2026 年 2 月，没有 2026 年 9 月 13 日的真实新闻数据，也无法联网搜索。为避免编造不实信息，我不能输出该日期的新闻清单。建议你通过新华社、央视、人民日报的官网或客户端查询当天报道。
+   usage = {"input_tokens": 98, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 232, "output_tokens_details": {"reasoning_tokens": 156}, "total_tokens": 330}
+
+========================================================================
+结论速查
+========================================================================
+模型名                              A旧参数         B新参数
+------------------------------------------------------------------------
+deepseek-flash                    102           40
+deepseek-v4-pro                   293          321
+
+判读方法：
+  · 数字 > 300 且『是否发生搜索调用 = True』 → 这个模型名 + 这组参数可用
+  · 数字 < 100                              → 搜索没生效，或响应被截断
+  · -1                                      → HTTP 报错
+  · status = incomplete                    → 被 token 上限截断（加大 max_output_tokens）
+
+若 A/B 都失败但 D（不带 tools）成功 → 说明 web_search 工具在当前模型上不被支持。
+========================================================================
