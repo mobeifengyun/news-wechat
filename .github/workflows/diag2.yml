@@ -1,0 +1,238 @@
+name: 诊断v2（结果自动回写仓库）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      SEARCH_MODE: ${{ secrets.SEARCH_MODE }}
+      RUN_TAG: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install --quiet requests
+
+      - name: 跑诊断
+        run: |
+          mkdir -p diag
+          cat > /tmp/probe.py <<'PYEOF'
+          # -*- coding: utf-8 -*-
+          """诊断 v2：把 DeepSeek /responses 的真实响应结构打印出来，并写回仓库。
+          安全说明：本脚本绝不打印 API Key。"""
+          import os, json, time, sys
+          import requests
+
+          OUT = []
+          def P(s=""):
+              print(s)
+              OUT.append(str(s))
+
+          KEY  = (os.environ.get("LLM_API_KEY") or "").strip()
+          BASE = (os.environ.get("LLM_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+          MODEL = (os.environ.get("LLM_MODEL") or "").strip()
+          MODE  = (os.environ.get("SEARCH_MODE") or "").strip()
+          if BASE.endswith("/v1"):
+              BASE = BASE[:-3]
+
+          def unmask(v):
+              if not v:
+                  return "(空)"
+              return "len=%d chars=[%s]" % (len(v), " | ".join(v))
+
+          P("=" * 72)
+          P("第 0 步 · 当前配置（已绕开 Secret 打码）")
+          P("=" * 72)
+          P("LLM_BASE_URL : " + unmask(BASE))
+          P("LLM_MODEL    : " + unmask(MODEL))
+          P("SEARCH_MODE  : " + unmask(MODE))
+          P("API Key      : " + (("已配置 sk-...%s (%d 位)" % (KEY[-4:], len(KEY))) if KEY else "【未配置】"))
+          P("")
+
+          if not KEY:
+              P("!! 致命：LLM_API_KEY 这个 Secret 没有值。")
+              P("   去 Settings -> Secrets and variables -> Actions 检查。")
+              P("   注意：Secret 保存后无法查看原值，只能重新填一次。")
+              open("/tmp/rc.txt", "w").write("NOKEY")
+              raise SystemExit(1)
+
+          HDR = {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
+
+          # ---------------------------------------------------------- 1 模型清单
+          P("=" * 72)
+          P("第 1 步 · 官方模型清单（GET /models）")
+          P("=" * 72)
+          avail = []
+          try:
+              r = requests.get(BASE + "/models", headers=HDR, timeout=40)
+              P("HTTP %s" % r.status_code)
+              if r.status_code == 200:
+                  avail = [m.get("id", "") for m in r.json().get("data", [])]
+                  P("共 %d 个：" % len(avail))
+                  for m in avail:
+                      P("    " + m)
+              else:
+                  P(r.text[:400])
+          except Exception as e:
+              P("请求失败: %s" % e)
+          P("")
+
+          # ---------------------------------------------------------- 2 逐个实测
+          QS = ("请联网搜索 2026 年 9 月 13 日中国国内发生的重要新闻（新华社/央视/人民日报），"
+                "列出 3 条，每条含：标题、来源媒体、一句话摘要。只输出清单，不要解释。")
+
+          CAND = []
+          for c in [MODEL, "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro",
+                    "deepseek-chat", "deepseek-reasoner"]:
+              if c and c not in CAND:
+                  CAND.append(c)
+
+          def probe(name, model, token_param, input_style, with_tools, with_choice):
+              body = {"model": model}
+              if with_tools:
+                  body["tools"] = [{"type": "web_search"}]
+              if with_choice:
+                  body["tool_choice"] = {"type": "web_search"}
+              if input_style == "list":
+                  body["input"] = [
+                      {"role": "system", "content": "你是新闻编辑，必须联网搜索真实新闻，不要凭记忆编造。"},
+                      {"role": "user", "content": QS},
+                  ]
+              else:
+                  body["instructions"] = "你是新闻编辑，必须联网搜索真实新闻，不要凭记忆编造。"
+                  body["input"] = QS
+              body[token_param] = 2048
+              body["reasoning"] = {"effort": "low"}
+
+              P("-" * 72)
+              P("[%s] model=%s" % (name, model))
+              P("    input=%s  token=%s  tools=%s  tool_choice=%s"
+                % (input_style, token_param, with_tools, with_choice))
+              t0 = time.time()
+              try:
+                  r = requests.post(BASE + "/responses", headers=HDR,
+                                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                    timeout=150)
+              except Exception as e:
+                  P("   异常: %s" % e)
+                  return -1
+              dt = time.time() - t0
+              P("   HTTP %s  耗时 %.1fs  响应 %d 字节" % (r.status_code, dt, len(r.content)))
+              if r.status_code != 200:
+                  P("   " + r.text[:300].replace("\n", " "))
+                  return -1
+              resp = r.json()
+
+              P("   status = %s" % resp.get("status"))
+              if resp.get("incomplete_details"):
+                  P("   incomplete_details = %s" % json.dumps(resp.get("incomplete_details"), ensure_ascii=False)[:300])
+              if resp.get("error"):
+                  P("   error = %s" % json.dumps(resp.get("error"), ensure_ascii=False)[:300])
+              P("   顶层字段 = %s" % sorted(resp.keys()))
+
+              has_search_call = False
+              P("   output 项：")
+              for it in (resp.get("output") or []):
+                  t = it.get("type")
+                  if "search" in str(t):
+                      has_search_call = True
+                  ct = [c.get("type") for c in (it.get("content") or [])]
+                  st = it.get("status")
+                  extra = ""
+                  if t in ("web_search_call",) or "search" in str(t):
+                      extra = "  action=%s" % json.dumps(it.get("action"), ensure_ascii=False)[:160]
+                  P("      - type=%-20s status=%-10s content=%s%s" % (t, st, ct, extra))
+
+              text = resp.get("output_text") or ""
+              if not text:
+                  for it in (resp.get("output") or []):
+                      for c in (it.get("content") or []):
+                          if c.get("type") == "output_text" and c.get("text"):
+                              text += c["text"]
+              P("   提取文本 %d 字符   是否发生搜索调用 = %s" % (len(text), has_search_call))
+              P("   样例: %s" % (text[:250].replace("\n", " ") or "(空)"))
+
+              usage = resp.get("usage") or {}
+              if usage:
+                  P("   usage = %s" % json.dumps(usage, ensure_ascii=False))
+              P("")
+              return len(text)
+
+          P("=" * 72)
+          P("第 2 步 · 逐模型实测（重点看 是否发生搜索调用 / status / 文本长度）")
+          P("=" * 72)
+          P("")
+
+          summary = []
+          for m in CAND:
+              if avail and m not in avail:
+                  P("--- %s : 官方 /models 清单里没有，跳过" % m)
+                  P("")
+                  continue
+              a = probe("A 旧参数(项目现用)", m, "max_tokens", "list", True, True)
+              b = probe("B 新参数(官方正确)", m, "max_output_tokens", "list", True, True)
+              summary.append((m, a, b))
+
+          P("=" * 72)
+          P("第 3 步 · 对照实验（用 B 新参数，变动其他条件）")
+          P("=" * 72)
+          P("")
+          if MODEL and (not avail or MODEL in avail):
+              probe("C 不指定 tool_choice", MODEL, "max_output_tokens", "str", True, False)
+              probe("D 完全不带 tools", MODEL, "max_output_tokens", "str", False, False)
+              probe("E input 用字符串", MODEL, "max_output_tokens", "str", True, True)
+
+          P("=" * 72)
+          P("结论速查")
+          P("=" * 72)
+          P("%-24s %12s %12s" % ("模型名", "A旧参数", "B新参数"))
+          P("-" * 72)
+          for m, a, b in summary:
+              P("%-24s %12s %12s" % (m, a, b))
+          P("")
+          P("判读方法：")
+          P("  · 数字 > 300 且『是否发生搜索调用 = True』 → 这个模型名 + 这组参数可用")
+          P("  · 数字 < 100                              → 搜索没生效，或响应被截断")
+          P("  · -1                                      → HTTP 报错")
+          P("  · status = incomplete                    → 被 token 上限截断（加大 max_output_tokens）")
+          P("")
+          P("若 A/B 都失败但 D（不带 tools）成功 → 说明 web_search 工具在当前模型上不被支持。")
+          P("=" * 72)
+
+          open("/tmp/rc.txt", "w").write("OK")
+          PYEOF
+          python /tmp/probe.py 2>&1 | tee diag/RESULT.txt
+          echo "RC=${PIPESTATUS[0]}"
+          test -f /tmp/rc.txt || echo "NOKEY" > /tmp/rc.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diag-result-${{ github.run_id }}
+          path: diag/RESULT.txt
+
+      - name: 回写结果到仓库
+        run: |
+          set -e
+          cp diag/RESULT.txt "diag/RESULT-${RUN_TAG}.txt"
+          git config user.name "diag-bot"
+          git config user.email "diag-bot@users.noreply.github.com"
+          git add -f "diag/RESULT.txt" "diag/RESULT-${RUN_TAG}.txt"
+          if git diff --cached --quiet; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "diag result run-${RUN_TAG}"
+            git push origin HEAD:main
+            echo "已提交到仓库 diag/ 目录"
+          fi
