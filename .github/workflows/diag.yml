@@ -1,0 +1,212 @@
+name: 诊断（大模型联网搜索实测）
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      SEARCH_MODE: ${{ secrets.SEARCH_MODE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install --quiet requests
+
+      - name: 跑诊断
+        run: |
+          cat > /tmp/probe.py <<'PYEOF'
+          # -*- coding: utf-8 -*-
+          """一次性诊断：把 DeepSeek /responses 的真实响应结构打印出来。
+          安全说明：本脚本绝不打印 API Key。"""
+          import os, json, time
+          import requests
+
+          KEY  = (os.environ.get("LLM_API_KEY") or "").strip()
+          BASE = (os.environ.get("LLM_BASE_URL") or "https://api.deepseek.com").rstrip("/")
+          MODEL = (os.environ.get("LLM_MODEL") or "").strip()
+          MODE  = (os.environ.get("SEARCH_MODE") or "").strip()
+          if BASE.endswith("/v1"):
+              BASE = BASE[:-3]
+
+          def unmask(v):
+              """逐字符打印，绕开 GitHub 的 Secret 打码（只用于模型名/模式，不用于密钥）"""
+              if not v:
+                  return "(空)"
+              return "len=%d chars=[%s]" % (len(v), " | ".join(v))
+
+          print("=" * 72)
+          print("第 0 步 · 当前配置（已绕开打码）")
+          print("=" * 72)
+          print("LLM_BASE_URL :", unmask(BASE))
+          print("LLM_MODEL    :", unmask(MODEL))
+          print("SEARCH_MODE  :", unmask(MODE))
+          print("API Key      :", ("已配置 sk-...%s (%d 位)" % (KEY[-4:], len(KEY))) if KEY else "【未配置】")
+          if not KEY:
+              print("!! 没有密钥，后面的实测全部跳过")
+              raise SystemExit(0)
+
+          HDR = {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
+
+          # ---------------------------------------------------------- 1 模型清单
+          print()
+          print("=" * 72)
+          print("第 1 步 · 官方模型清单")
+          print("=" * 72)
+          avail = []
+          try:
+              r = requests.get(BASE + "/models", headers=HDR, timeout=40)
+              print("HTTP", r.status_code)
+              if r.status_code == 200:
+                  avail = [m.get("id", "") for m in r.json().get("data", [])]
+                  print("共 %d 个：" % len(avail))
+                  for m in avail:
+                      print("   ", m)
+              else:
+                  print(r.text[:300])
+          except Exception as e:
+              print("请求失败:", e)
+
+          # ---------------------------------------------------------- 2 逐个实测
+          QS = ("请联网搜索 2026 年 9 月 13 日中国国内发生的重要新闻（新华社/央视/人民日报），"
+                "列出 3 条，每条含：标题、来源媒体、一句话摘要。只输出清单，不要解释。")
+
+          CAND = []
+          for c in [MODEL, "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat"]:
+              if c and c not in CAND:
+                  CAND.append(c)
+
+          def probe(name, model, use_max_output, input_style):
+              body = {
+                  "model": model,
+                  "tools": [{"type": "web_search"}],
+                  "tool_choice": {"type": "web_search"},
+              }
+              if input_style == "list":
+                  body["input"] = [
+                      {"role": "system", "content": "你是新闻编辑，必须联网搜索真实新闻，不要凭记忆编造。"},
+                      {"role": "user", "content": QS},
+                  ]
+              else:
+                  body["instructions"] = "你是新闻编辑，必须联网搜索真实新闻，不要凭记忆编造。"
+                  body["input"] = QS
+              if use_max_output:
+                  body["max_output_tokens"] = 2048   # 官方文档的正确参数名
+              else:
+                  body["max_tokens"] = 2048          # 项目里现在用的（已废弃）
+              body["reasoning"] = {"effort": "low"}
+
+              print()
+              print("-" * 72)
+              print("[%s] model=%s  input=%s  token_param=%s"
+                    % (name, model, input_style,
+                       "max_output_tokens" if use_max_output else "max_tokens(旧)"))
+              t0 = time.time()
+              try:
+                  r = requests.post(BASE + "/responses", headers=HDR,
+                                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                    timeout=150)
+              except Exception as e:
+                  print("   异常:", e)
+                  return None
+              dt = time.time() - t0
+              print("   HTTP %s  耗时 %.1fs  响应 %d 字节" % (r.status_code, dt, len(r.content)))
+              if r.status_code != 200:
+                  print("   ", r.text[:300].replace("\n", " "))
+                  return None
+              resp = r.json()
+
+              print("   status =", resp.get("status"))
+              if resp.get("incomplete_details"):
+                  print("   incomplete_details =", json.dumps(resp.get("incomplete_details"), ensure_ascii=False)[:300])
+              if resp.get("error"):
+                  print("   error =", json.dumps(resp.get("error"), ensure_ascii=False)[:300])
+
+              # 输出项结构
+              print("   output 项：")
+              for it in (resp.get("output") or []):
+                  t = it.get("type")
+                  ct = [c.get("type") for c in (it.get("content") or [])]
+                  st = it.get("status")
+                  print("      - type=%-18s status=%-10s content=%s" % (t, st, ct))
+
+              text = resp.get("output_text") or ""
+              if not text:
+                  for it in (resp.get("output") or []):
+                      for c in (it.get("content") or []):
+                          if c.get("type") == "output_text" and c.get("text"):
+                              text += c["text"]
+              print("   提取文本 %d 字符" % len(text))
+              print("   样例:", (text[:220].replace("\n", " ") or "(空)"))
+
+              usage = resp.get("usage") or {}
+              if usage:
+                  print("   usage =", json.dumps(usage, ensure_ascii=False))
+              return len(text)
+
+          print()
+          print("=" * 72)
+          print("第 2 步 · 逐模型实测（重点看 status / output 项 / 文本长度）")
+          print("=" * 72)
+
+          results = {}
+          for m in CAND:
+              if avail and m not in avail:
+                  print()
+                  print("--- %s : 官方清单里没有，跳过" % m)
+                  continue
+              a = probe("A-旧参数", m, False, "list")
+              b = probe("B-新参数", m, True, "list")
+              results[m] = (a, b)
+
+          print()
+          print("=" * 72)
+          print("第 3 步 · 对照：不指定 tool_choice（让模型自己决定要不要搜）")
+          print("=" * 72)
+          if MODEL:
+              body = {
+                  "model": MODEL,
+                  "input": QS,
+                  "instructions": "你是新闻编辑，必须联网搜索真实新闻，不要凭记忆编造。",
+                  "tools": [{"type": "web_search"}],
+                  "max_output_tokens": 2048,
+                  "reasoning": {"effort": "low"},
+              }
+              try:
+                  r = requests.post(BASE + "/responses", headers=HDR,
+                                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                    timeout=150)
+                  print("HTTP", r.status_code)
+                  if r.status_code == 200:
+                      resp = r.json()
+                      print("status =", resp.get("status"))
+                      print("output 项：")
+                      for it in (resp.get("output") or []):
+                          print("   - type=%-18s status=%s content=%s"
+                                % (it.get("type"), it.get("status"),
+                                   [c.get("type") for c in (it.get("content") or [])]))
+                      t = resp.get("output_text") or ""
+                      print("提取文本 %d 字符" % len(t))
+                      print("样例:", t[:220].replace("\n", " "))
+                  else:
+                      print(r.text[:300])
+              except Exception as e:
+                  print("异常:", e)
+
+          print()
+          print("=" * 72)
+          print("结论速查：看每个 [A-旧参数] / [B-新参数] 的『提取文本 N 字符』")
+          print("  · N > 300 且 output 里有 web_search_call  → 这个模型名可用")
+          print("  · N < 100                              → 搜索没生效或响应被截断")
+          print("  · status = incomplete                  → 被 max_output_tokens 截断了")
+          print("=" * 72)
+          PYEOF
+          python /tmp/probe.py
